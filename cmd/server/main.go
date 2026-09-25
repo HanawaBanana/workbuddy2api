@@ -217,6 +217,12 @@ func main() {
 		log.Printf("管理操作审计已启用：%s（每个 /admin 动作追加一行 JSONL）", al.Path())
 	}
 
+	// 当日积分预算闸（budget.daily_credit_limit，默认关闭）。
+	if cfg.Budget.DailyCreditLimit > 0 {
+		log.Printf("当日积分预算已启用：累计扣费达 %.2f credit 后拒服务（按 CST 自然日重置，实时用量见 /status 的 daily_budget）",
+			cfg.Budget.DailyCreditLimit)
+	}
+
 	h := server.NewHandler(server.Config{
 		Pool:         p,
 		Upstream:     up,
@@ -239,6 +245,8 @@ func main() {
 		// 管理操作审计接收器（admin.audit_enabled，默认关闭时为零值 nil =
 		// 不审计、零开销）。
 		Audit: auditLog,
+		// 当日积分预算上限（budget.daily_credit_limit，0 = 关闭该闸）。
+		BudgetLimit: cfg.Budget.DailyCreditLimit,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

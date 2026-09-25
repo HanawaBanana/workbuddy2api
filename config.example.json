@@ -59,6 +59,9 @@
     "clear_ticks": 2,
     "send_resolve": false
   },
+  "budget": {
+    "daily_credit_limit": 0
+  },
   "global": {
     "enabled": true,
     "chat_base": "",

@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -68,6 +69,11 @@ type Config struct {
 	// admin 也不该被动多出一个文件，故 config admin.audit_enabled 缺省关闭。
 	// 由 main 在启动期构造（NewAuditLog 会做可写性预检并 fail-fast）。
 	Audit *AuditLog
+
+	// BudgetLimit 当日累计 credit 上限（config budget.daily_credit_limit）。
+	// <=0 = 关闭该闸（不限），行为与引入前逐字一致。计数按 CST 自然日重置、
+	// 进程内不落盘（见 budget.go）。
+	BudgetLimit float64
 }
 
 // notFoundCooldown 上游 404 的固定短冷却时长。
@@ -108,6 +114,10 @@ type Handler struct {
 	// 手动任务，清零即正确，无需持久化。
 	taskMu      sync.Mutex
 	taskRunning map[string]bool
+
+	// budget 当日积分预算闸（budget.go）。恒非 nil（NewHandler 构造）；
+	// 仅当直接手搓 &Handler{} 时才为 nil，此时 admit/add 都是直通。
+	budget *dailyBudget
 }
 
 // NewHandler 构建 handler。
@@ -124,7 +134,12 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.PromptMode == "" {
 		cfg.PromptMode = "passthrough" // 缺省 passthrough：透传客户端原始 system
 	}
-	h := &Handler{cfg: cfg, mux: http.NewServeMux(), taskRunning: map[string]bool{}}
+	h := &Handler{
+		cfg:         cfg,
+		mux:         http.NewServeMux(),
+		taskRunning: map[string]bool{},
+		budget:      newDailyBudget(cfg.BudgetLimit),
+	}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
@@ -220,6 +235,10 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 	// (域, 模型) 的最近探索时刻（键 "realm|model"）。与 accounts[].model_costs
 	// 行对照即可读出「探索→毕业」全链路（单一事实来源，不做双表示）。零回归只增键。
 	exploreEvents, exploreLast := h.cfg.Pool.CostExploreStatus()
+	// daily_budget 当日积分预算台账（budget.go）：已用 / 上限 / 当日被拒次数。
+	// 上限为 0 表示闸关闭（不限），此时 used 仍照常累计——运维可以先用观察模式
+	// 跑几天、看真实日耗再决定阈值，不必先开闸才知道该设多少。
+	budgetUsed, budgetLimit, budgetRejected := h.budget.snapshot()
 	// realm_totals 按域分组的计数汇总（双 realm 并存时运维一眼看到各域可用性）：
 	// 只新增字段，既有 total/healthy/cooling/disabled/in_flight_full 汇总键不变（零回归）。
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -239,6 +258,13 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		"cost_explore": map[string]any{
 			"events_total": exploreEvents,
 			"per_model":    exploreLast,
+		},
+		// daily_budget 按 CST 自然日重置，进程重启清零（见 budget.go）。
+		"daily_budget": map[string]any{
+			"used":     budgetUsed,
+			"limit":    budgetLimit,
+			"rejected": budgetRejected,
+			"day":      cstDay(time.Now()),
 		},
 	})
 }
@@ -509,6 +535,16 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 }
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+	// 当日积分预算闸（config budget.daily_credit_limit，缺省 0 = 关闭）。
+	// 位置在**读 body 之前**：被拒的请求不该先把几十 MB 请求体读进内存再丢掉。
+	// 429 是 OpenAI 对「配额耗尽」的既有语义（客户端会退避重试），code 取自定义值
+	// 以便与账号级限流（上游 429 转出的 soft_rate 路径）区分开。
+	if !h.budget.admit() {
+		used, limit, _ := h.budget.snapshot()
+		writeOpenAIError(w, http.StatusTooManyRequests, "daily_budget_exceeded",
+			fmt.Sprintf("daily credit budget exhausted (used %.2f of %.2f, resets at 00:00 CST)", used, limit))
+		return
+	}
 	// 请求体无大小上限（max_body_mb 已移除）：完整读入，超限类问题交由上游自然返回
 	// 错误（其响应经既有错误分类链路透出，信息量更大）。#41 的截断防御语义保留在
 	// 读错误路径——移除预拦截后，截断只可能来自客户端自己断流，读 body 出错就地 400，
@@ -539,7 +575,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	realm, bareModel := resolveModel(peek.Model)
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
-	st := newChatStat(time.Now(), body, peek.Stream)
+	st := newChatStat(time.Now(), body, peek.Stream, h.budget)
 	defer st.done()
 
 	tried := map[string]bool{}

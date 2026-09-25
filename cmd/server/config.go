@@ -87,6 +87,20 @@ type Config struct {
 		SendResolve         bool   `json:"send_resolve"`          // 恢复时是否也发通知，默认 false
 	} `json:"alerting"`
 
+	// Budget 当日积分预算闸（admission control）。默认**关闭**：
+	// daily_credit_limit 为 0 表示不限，行为与改动前逐字一致。
+	// 当日累计扣费达到上限后，网关直接拒掉后续对话请求（429 + 明确错误码），
+	// 把积分损失截断在阈值附近——防的是跑飞的客户端、忘了关的脚本把积分烧光。
+	Budget struct {
+		// DailyCreditLimit 当日累计 credit 上限。**0 = 关闭该闸**（不限）——这是
+		// 哨兵值而非"未设置"，normalize 不会把它回落成默认值；负值报错。
+		// 计数按 CST 自然日重置（上游增长体系按 CST 刷新），进程重启即清零。
+		// 只统计上游 usage 给出 credit 的请求，故当日用量是**下界**、真实日耗只会
+		// 更多，阈值宜按保守值设（可先把闸当观察模式跑几天，看 /status 的
+		// daily_budget.used 再定）。
+		DailyCreditLimit float64 `json:"daily_credit_limit"`
+	} `json:"budget"`
+
 	Global struct {
 		// Enabled global realm 路由开关。缺省 true：Realm() 正常把 realm=global/
 		// domain=workbuddy.ai 的账号判为 global 并路由 global base/路径。
@@ -259,6 +273,9 @@ func Default() *Config {
 	// 该路径是惰性的，写出来只是让 config.example.json 的取值与实现一致。
 	c.Admin.AuditEnabled = false
 	c.Admin.AuditFile = "./data/admin_audit.log"
+	// 预算闸缺省关闭：daily_credit_limit 的 0 是"不限"哨兵，**故意不回落默认值**
+	// （与 alerting.min_healthy_global 同风格）。这里显式写出以明示这一意图。
+	c.Budget.DailyCreditLimit = 0
 	// Alerting 缺省关闭；各阈值/周期给默认值，但 min_healthy_global 与
 	// breaker_threshold 的 0 是"关闭该规则"的哨兵，不能改（见 Config.Alerting 注释）。
 	c.Alerting.IntervalSeconds = 30
@@ -375,6 +392,11 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("WB2A_ADMIN_AUDIT_FILE"); v != "" {
 		c.Admin.AuditFile = v
+	}
+	if v := os.Getenv("WB2A_BUDGET_DAILY_CREDIT_LIMIT"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			c.Budget.DailyCreditLimit = f
+		}
 	}
 	if v := os.Getenv("WB2A_METRICS_ENABLED"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
@@ -527,6 +549,11 @@ func (c *Config) normalize() error {
 		if strings.TrimSpace(c.Admin.AuditFile) == "" {
 			return fmt.Errorf("admin.audit_enabled=true 但 admin.audit_file 为空：请填写审计日志路径或将 admin.audit_enabled 置 false")
 		}
+	}
+	// 预算闸：只有负值非法。0 是"不限"的合法哨兵，**不回落**——把 0 改写成某个
+	// 默认上限，等于在老部署上凭空开始拒请求，正是"缺省 = 旧行为"要禁止的事。
+	if c.Budget.DailyCreditLimit < 0 {
+		return fmt.Errorf("budget.daily_credit_limit: %v 不得为负；0 = 关闭该闸（不限）", c.Budget.DailyCreditLimit)
 	}
 	// 告警段归一 + fail-fast（enabled=true 且 webhook_url 缺失/非法 → 拒绝启动）。
 	// 位置与上面的 admin 校验并列：两者都是"开了功能就必须给齐参数"的启动期拦截。

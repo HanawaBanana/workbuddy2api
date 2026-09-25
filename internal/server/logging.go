@@ -42,16 +42,21 @@ type chatStat struct {
 	credit    float64
 	hasCredit bool
 
+	// budget 当日积分预算计数器（budget.go；nil = 未接线）。记账放在 done()，
+	// 与 metrics 共用「全路径唯一出口」这条纪律——不新增埋点，不重复记账。
+	budget *dailyBudget
+
 	logged bool
 }
 
 // newChatStat 以请求进入 handler 的时刻为起点构造统计对象；toks 默认 -1（usage 缺失）。
-func newChatStat(now time.Time, body []byte, stream bool) *chatStat {
+// budget 为当日积分预算计数器（budget.go），nil = 未接线、不计数。
+func newChatStat(now time.Time, body []byte, stream bool, budget *dailyBudget) *chatStat {
 	mode := "sync"
 	if stream {
 		mode = "stream"
 	}
-	return &chatStat{start: now, model: parseModelFromBody(body), mode: mode, toks: -1}
+	return &chatStat{start: now, model: parseModelFromBody(body), mode: mode, toks: -1, budget: budget}
 }
 
 // done 幂等落一行表格日志，并把本次请求记入 metrics 聚合（/v1/stats 数据源）。
@@ -66,6 +71,10 @@ func (s *chatStat) done() {
 	total := time.Since(s.start)
 	logChatRow(s.ttfb, total, s.model, s.mode, s.uid, s.nick, s.status, s.toks)
 	recordChatMetric(s, total)
+	// 当日积分预算累计（budget.go）。只在 hasCredit 时累加：缺失≠0，与成本账本、
+	// /v1/stats 同一纪律——把「没观测到」当 0 会让用量永远涨不上去、闸形同虚设。
+	// 注意本闸是**事后**记账：这一笔已经花出去了，它挡的是后续请求。
+	s.budget.add(s.credit, s.hasCredit)
 }
 
 // chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，
