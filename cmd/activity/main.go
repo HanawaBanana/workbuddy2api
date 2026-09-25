@@ -105,6 +105,7 @@ func main() {
 		ActivityHours:       c.Schedule.ActivityHours,
 		KeepaliveHours:       c.Schedule.KeepaliveHours,
 		ActivityReportCount: c.Schedule.ActivityReportCount,
+		JitterMinutes:       c.Schedule.JitterMinutes, // 本工具一次性触发、从不进 Run 循环，抖动无实际作用；一并接线保持构造完整
 	})
 	sch.RunActivityNow()
 	log.Printf("activity run complete")

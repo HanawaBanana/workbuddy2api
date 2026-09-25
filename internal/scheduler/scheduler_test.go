@@ -21,17 +21,17 @@ import (
 func TestNextFire(t *testing.T) {
 	loc := time.Local
 	now := time.Date(2026, 7, 27, 10, 0, 0, 0, loc)
-	next := nextFire(now, []int{9, 21})
+	next := nextFire(now, []int{9, 21}, taskCheckin, 0)
 	if next.Hour() != 21 || next.Day() != 27 {
 		t.Errorf("next=%v want 21:00 same day", next)
 	}
 	now = time.Date(2026, 7, 27, 22, 0, 0, 0, loc)
-	next = nextFire(now, []int{9, 21})
+	next = nextFire(now, []int{9, 21}, taskCheckin, 0)
 	if next.Hour() != 9 || next.Day() != 28 {
 		t.Errorf("next=%v want 09:00 next day", next)
 	}
 	now = time.Date(2026, 7, 27, 9, 0, 0, 0, loc)
-	next = nextFire(now, []int{9})
+	next = nextFire(now, []int{9}, taskCheckin, 0)
 	if next.Day() != 28 {
 		t.Errorf("exact match should roll to next day: %v", next)
 	}
@@ -39,7 +39,7 @@ func TestNextFire(t *testing.T) {
 
 func TestNextFireMergesSchedules(t *testing.T) {
 	now := time.Date(2026, 7, 27, 20, 0, 0, 0, time.Local)
-	next := nextFire(now, []int{9, 21, 22})
+	next := nextFire(now, []int{9, 21, 22}, taskCheckin, 0)
 	if next.Hour() != 21 {
 		t.Errorf("next=%v want 21 (earliest of 21/22)", next)
 	}

@@ -33,7 +33,8 @@
     "activity_enabled": true,
     "keepalive_enabled": true,
     "school_enabled": true,
-    "cat_enabled": true
+    "cat_enabled": true,
+    "jitter_minutes": 0
   },
   "admin": {
     "enabled": false

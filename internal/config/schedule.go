@@ -38,6 +38,16 @@ type Schedule struct {
 	// ActivityReportCount 每号每次活跃上报的条数：领猫前置需 5 次对话，
 	// 默认 5 条把 chat_5 刷满；0/缺省=1 兼容旧行为。
 	ActivityReportCount int `json:"activity_report_count"`
+	// JitterMinutes 触发时刻抖动窗口（分钟，默认 0 = 关闭）。
+	//
+	// 六类任务的触发时刻默认精确落在整点（迁移自系统 crontab 的 `0 9 * * *` 语义），
+	// 于是所有部署都在同一秒打上游，形成对齐的突发——对 WAF 不友好。设为正值后，
+	// 每类任务的触发时刻在该窗口内取一个**确定性**偏移（同一任务、同一天、同一小时
+	// 永远得到同一个偏移，见 scheduler.jitterOffset），把负载摊开。
+	//
+	// 为什么 0 是"关闭"而不是"回落默认"：它是这里的缺省值本身，也是「保持与引入前
+	// 逐字一致」的开关，不是笔误——与 *_enabled 缺省 true 是两回事。
+	JitterMinutes int `json:"jitter_minutes"`
 	// 猫猫旅行已退役 travel_interval_minutes：旅行现为独立排程（travel_hours）。
 	// 旧 config 里的该键因 JSON 未知字段而自然忽略，不报错。
 }
@@ -73,6 +83,8 @@ func DefaultSchedule() Schedule {
 // ActivityReportCount：0/负数 → 1 条（兼容旧行为：每号每天 1 条上报点亮连登）。
 // 注意这是「显式配 0 = 旧行为」的兼容语义，与 scheduler.New 的 <=0 → 1 归一一致；
 // 「缺省 = 5」由 DefaultSchedule 在 Unmarshal 前置入，是另一条路径，两者不合并。
+//
+// JitterMinutes：0 = 关闭（缺省，保持精确整点）；负值/超上限直接报错，不静默回落。
 func (s *Schedule) Normalize() error {
 	if len(s.CheckinHours) == 0 {
 		s.CheckinHours = []int{9, 21}
@@ -95,6 +107,17 @@ func (s *Schedule) Normalize() error {
 	// 0/负数 → 1 条（兼容旧行为：每号每天 1 条上报点亮连登）。
 	if s.ActivityReportCount <= 0 {
 		s.ActivityReportCount = 1
+	}
+	// JitterMinutes：0 = 关闭（缺省，精确整点）；负值报错（无合理语义）；
+	// 上限 1440（一天）——偏移必须小于 24h，否则触发时刻会漂到名义时点之后一整天，
+	// 当天那次实际上被跳过。注意窗口大于相邻槽位间隔（如 9 点与 10 点相隔 60 分钟）时，
+	// 任务顺序可能与配置的小时顺序不一致：这是摊开负载的必然代价，不是 bug。
+	if s.JitterMinutes < 0 {
+		return fmt.Errorf("schedule.jitter_minutes: %d 不得为负；0 = 关闭抖动（精确整点）", s.JitterMinutes)
+	}
+	if s.JitterMinutes > 1440 {
+		return fmt.Errorf("schedule.jitter_minutes: %d 过大（上限 1440 分钟 = 一天）；"+
+			"抖动窗口必须小于 24h，否则当天那次任务会被整体推到次日", s.JitterMinutes)
 	}
 	return s.validateHours()
 }

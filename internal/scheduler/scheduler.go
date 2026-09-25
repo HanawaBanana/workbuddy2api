@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"sync"
 	"time"
@@ -29,6 +30,10 @@ type Config struct {
 	KeepaliveHours []int // 默认 [22]
 	SchoolHours    []int // 默认 [12]：开学季任务（迁移自系统 crontab）
 	CatHours       []int // 默认 [1]：夜猫子任务（迁移自系统 crontab）
+	// JitterMinutes 触发时刻抖动窗口（分钟）：每类任务的触发时刻在该窗口内取一个
+	// **确定性**偏移，把「所有部署都在整点同一秒打上游」摊开，对 WAF 友好。
+	// 0/缺省 = 不加偏移（精确整点，与引入前逐字一致）。
+	JitterMinutes int
 	// ActivityReportCount 每号每次活跃上报的条数：领猫前置需 5 次对话，
 	// 默认 5 条同一 conversationId 内多轮上报把 chat_5 刷满；0/缺省=1 兼容旧行为。
 	ActivityReportCount int
@@ -125,16 +130,52 @@ type CheckinOutcome struct {
 // ErrBusy 已有一次签到正在执行（手动入口与定时撞车）。
 var ErrBusy = errors.New("checkin already running")
 
-// nextFire 返回 now 之后最近的一个整点触发时间；hours 为本地小时（0-23）。
-func nextFire(now time.Time, hours []int) time.Time {
+// jitterOffset 返回「任务类 + 名义时点」的**确定性**偏移，落在 [0, jitterMinutes) 分钟。
+//
+// 为什么必须确定性（而不是每次现摇一个随机数）：
+// Run 主循环每一轮都重新调用 nextWake。若偏移每次不同，某个槽位触发完再重算时，
+// 新摇出的偏移仍可能落在"现在之后"——于是同一个小时被反复派发，任务重复执行。
+// 用「任务名 | 日期 | 小时」派生后，同一槽位每次算出的偏移完全一致：触发过的时点
+// 不再 After(now)，自然顺延到次日。这同时也是可测的前提。
+//
+// 散列用 FNV-1a：标准库自带、无状态、不引 math/rand 全局种子（那会让结果依赖调用
+// 顺序）。语义与 internal/server 的 jitterDur（±25% 时长缩放、随机）不同，故不复用。
+func jitterOffset(kind taskKind, nominal time.Time, jitterMinutes int) time.Duration {
+	if jitterMinutes <= 0 {
+		return 0 // 0/负数 = 不加偏移（旧行为）
+	}
+	span := time.Duration(jitterMinutes) * time.Minute
+	secs := int64(span / time.Second)
+	if secs <= 0 {
+		return 0
+	}
+	h := fnv.New32a()
+	// 名义时点用「日期 + 小时」参与散列：同一天同一小时的偏移固定，换一天则变。
+	_, _ = fmt.Fprintf(h, "%s|%s", kind, nominal.Format("2006-01-02T15"))
+	return time.Duration(int64(h.Sum32())%secs) * time.Second
+}
+
+// nextFire 返回 now 之后最近的一个触发时刻；hours 为本地小时（0-23）。
+//
+// jitterMinutes > 0 时给每个候选时点加上 jitterOffset 的确定性偏移（按 kind 与
+// 名义时点派生），用于把整点齐发的负载摊开。偏移只在**定下日期之后**施加：先算
+// 今天的名义时点、加偏移、若已过则改用明天的名义时点重新算偏移——否则跨日时
+// 偏移会串到错误的日期上。
+func nextFire(now time.Time, hours []int, kind taskKind, jitterMinutes int) time.Time {
 	var earliest time.Time
 	for _, h := range hours {
-		t := time.Date(now.Year(), now.Month(), now.Day(), h, 0, 0, 0, now.Location())
-		if !t.After(now) {
-			t = t.Add(24 * time.Hour)
-		}
-		if earliest.IsZero() || t.Before(earliest) {
-			earliest = t
+		// 先试今天，过了再试明天（最多两天足够：明天同一小时必然在 now 之后）。
+		for d := 0; d < 2; d++ {
+			nominal := time.Date(now.Year(), now.Month(), now.Day(), h, 0, 0, 0, now.Location()).
+				AddDate(0, 0, d)
+			t := nominal.Add(jitterOffset(kind, nominal, jitterMinutes))
+			if !t.After(now) {
+				continue
+			}
+			if earliest.IsZero() || t.Before(earliest) {
+				earliest = t
+			}
+			break
 		}
 	}
 	return earliest
@@ -152,6 +193,26 @@ const (
 	taskCat
 )
 
+// String 返回任务类的稳定名字，用作抖动散列的种子（不要用 iota 数值：数值会随
+// 枚举顺序调整而变，名字不会，且日志里可读）。
+func (k taskKind) String() string {
+	switch k {
+	case taskCheckin:
+		return "checkin"
+	case taskTravel:
+		return "travel"
+	case taskActivity:
+		return "activity"
+	case taskKeepalive:
+		return "keepalive"
+	case taskSchool:
+		return "school"
+	case taskCat:
+		return "cat"
+	}
+	return "unknown"
+}
+
 // nextWake 返回 now 之后最近的唤醒时刻，以及该时刻需要执行的全部任务。
 // 多类任务若配到同一小时（如签到与旅行都含 9），该时刻多类任务需一并执行。
 // 已显式禁用的任务不进候选（nextFire 对其零值返回零时间，nextWake 再跳过零时点）。
@@ -161,23 +222,24 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 		kind taskKind
 	}
 	var slots []slot
+	jit := s.cfg.JitterMinutes
 	if !s.cfg.CheckinDisabled {
-		slots = append(slots, slot{nextFire(now, s.cfg.CheckinHours), taskCheckin})
+		slots = append(slots, slot{nextFire(now, s.cfg.CheckinHours, taskCheckin, jit), taskCheckin})
 	}
 	if !s.cfg.TravelDisabled {
-		slots = append(slots, slot{nextFire(now, s.cfg.TravelHours), taskTravel})
+		slots = append(slots, slot{nextFire(now, s.cfg.TravelHours, taskTravel, jit), taskTravel})
 	}
 	if !s.cfg.ActivityDisabled {
-		slots = append(slots, slot{nextFire(now, s.cfg.ActivityHours), taskActivity})
+		slots = append(slots, slot{nextFire(now, s.cfg.ActivityHours, taskActivity, jit), taskActivity})
 	}
 	if !s.cfg.KeepaliveDisabled {
-		slots = append(slots, slot{nextFire(now, s.cfg.KeepaliveHours), taskKeepalive})
+		slots = append(slots, slot{nextFire(now, s.cfg.KeepaliveHours, taskKeepalive, jit), taskKeepalive})
 	}
 	if !s.cfg.SchoolDisabled {
-		slots = append(slots, slot{nextFire(now, s.cfg.SchoolHours), taskSchool})
+		slots = append(slots, slot{nextFire(now, s.cfg.SchoolHours, taskSchool, jit), taskSchool})
 	}
 	if !s.cfg.CatDisabled {
-		slots = append(slots, slot{nextFire(now, s.cfg.CatHours), taskCat})
+		slots = append(slots, slot{nextFire(now, s.cfg.CatHours, taskCat, jit), taskCat})
 	}
 	var earliest time.Time
 	for _, sl := range slots {

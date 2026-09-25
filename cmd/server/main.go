@@ -155,13 +155,15 @@ func main() {
 		SchoolHours:         cfg.Schedule.SchoolHours,
 		CatHours:            cfg.Schedule.CatHours,
 		ActivityReportCount: cfg.Schedule.ActivityReportCount,
-		ExpiringSoonWindow:  cfg.ExpiringSoonDur, // 快过期积分优先消耗（issue:积分过期）
-		CheckinDisabled:     !cfg.Schedule.CheckinEnabled,
-		TravelDisabled:      !cfg.Schedule.TravelEnabled,
-		ActivityDisabled:    !cfg.Schedule.ActivityEnabled,
-		KeepaliveDisabled:   !cfg.Schedule.KeepaliveEnabled,
-		SchoolDisabled:      !cfg.Schedule.SchoolEnabled,
-		CatDisabled:         !cfg.Schedule.CatEnabled,
+		// 触发时刻抖动窗口（schedule.jitter_minutes，0 = 精确整点 = 旧行为）。
+		JitterMinutes:      cfg.Schedule.JitterMinutes,
+		ExpiringSoonWindow: cfg.ExpiringSoonDur, // 快过期积分优先消耗（issue:积分过期）
+		CheckinDisabled:    !cfg.Schedule.CheckinEnabled,
+		TravelDisabled:     !cfg.Schedule.TravelEnabled,
+		ActivityDisabled:   !cfg.Schedule.ActivityEnabled,
+		KeepaliveDisabled:  !cfg.Schedule.KeepaliveEnabled,
+		SchoolDisabled:     !cfg.Schedule.SchoolEnabled,
+		CatDisabled:        !cfg.Schedule.CatEnabled,
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
@@ -195,6 +197,10 @@ func main() {
 		log.Printf("夜猫子任务已禁用（schedule.cat_enabled=false）")
 	} else {
 		log.Printf("夜猫子任务已启用：%v 点（task_runner.py ALL --yes --only black_cat）", cfg.Schedule.CatHours)
+	}
+	if cfg.Schedule.JitterMinutes > 0 {
+		log.Printf("排程抖动已启用：各任务触发时刻在名义整点后 0-%d 分钟内确定性偏移（schedule.jitter_minutes）",
+			cfg.Schedule.JitterMinutes)
 	}
 
 	h := server.NewHandler(server.Config{
