@@ -1,4 +1,4 @@
-// acct — 账号运维工具：临时停用 / 恢复 / 复活（issue #138/#118）。
+// acct — 账号与任务运维工具：临时停用 / 恢复 / 复活 / 手动触发排程任务（issue #138/#118）。
 //
 // 用法:
 //
@@ -6,6 +6,7 @@
 //	acct disable <uid> [reason]        # 临时停用（对话流量摘除，保留在池里）
 //	acct enable  <uid>                 # 解除手动停用
 //	acct revive  <uid>                 # 解除系统自动禁用
+//	acct task <name>                   # 手动触发一个排程积分任务（异步受理）
 //
 // 配置:
 //
@@ -15,6 +16,7 @@
 // 为什么走 HTTP 而不是直接改 state.json：手动停用是**运行中进程的内存状态**，
 // 由池的定时 flush 落盘（5s 周期）。外部直接改文件会在下一次 flush 被覆盖——
 // 这正是 issue #138 里面板侧绕不过去的死路。经端点操作才能可靠生效并被持久化。
+// 手动触发任务同理：任务跑在网关进程里，只有让网关自己跑才算数。
 package main
 
 import (
@@ -97,6 +99,14 @@ func main() {
 		if err := doAdmin(base, apiKey, op, uid, reason); err != nil {
 			fatalf("%v", err)
 		}
+	case "task":
+		if len(args) < 2 || strings.TrimSpace(args[1]) == "" {
+			fmt.Fprintf(os.Stderr, "acct: task 需要一个任务名（%s）\n", strings.Join(adminTaskNames, " / "))
+			os.Exit(2)
+		}
+		if err := runTask(base, apiKey, strings.TrimSpace(args[1])); err != nil {
+			fatalf("%v", err)
+		}
 	default:
 		fmt.Fprintf(os.Stderr, "acct: 未知子命令 %q\n", op)
 		usage()
@@ -105,13 +115,19 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `acct — 账号运维工具
+	fmt.Fprint(os.Stderr, `acct — 账号与任务运维工具
 
 用法:
   acct list                    列出账号与状态（含 manual_disabled / disabled 双位）
   acct disable <uid> [reason]  临时停用：摘出选号池，但仍留在池里
   acct enable  <uid>           解除手动停用
   acct revive  <uid>           解除系统自动禁用
+  acct task <name>             手动触发一个排程积分任务
+
+任务名（acct task 用）:
+  checkin    签到（每日 9/21 点）        activity   活跃地图（10 点）
+  keepalive  token 保活（22 点）          travel     猫猫旅行（9/21 点）
+  school     开学季任务（12 点）          cat        夜猫子任务（1 点）
 
 选项:
   -config <path>  配置路径（默认 config.json，读 listen 与 api_key）
@@ -119,6 +135,10 @@ func usage() {
 
 注意：enable 只解手动位。若账号同时被系统自动禁用（disabled），
 需要额外执行 revive 才能回到选号池。
+
+注意：task 是**异步受理**——网关立刻回执并在后台开跑，命令不等任务跑完
+（这些任务遍历全池打上游，耗时可达分钟级）。进度看网关日志；同一任务
+已在跑时会回 409，等它跑完再触发。
 `)
 }
 
@@ -300,6 +320,40 @@ func doAdmin(base, apiKey, op, uid, reason string) error {
 	if op == "revive" && st.ManualDisabled {
 		fmt.Println("提示：该账号仍处于手动停用，要回到选号池还需执行 acct enable " + st.UID)
 	}
+	return nil
+}
+
+// adminTaskNames 可手动触发的任务名。与 server 侧白名单（admin_tasks.go）一致；
+// 这里只用于用法提示与参数校验，真正的准入以网关的 404 为准（单一真源在服务端）。
+var adminTaskNames = []string{"checkin", "activity", "keepalive", "travel", "school", "cat"}
+
+// runTask 手动触发一个排程任务：POST /admin/tasks/{name}/run。
+//
+// 网关是**异步受理**（202）：任务在服务端后台跑，本命令不等它跑完——这些任务
+// 遍历全池打上游、部分还起 python 子进程，同步等待会让命令挂到分钟级且看不出
+// 是卡住了还是在跑。所以这里只回执「已受理」，进度看网关日志。
+func runTask(base, apiKey, name string) error {
+	code, raw, err := httpDo(base, apiKey, http.MethodPost, "/admin/tasks/"+name+"/run", nil)
+	if err != nil {
+		return err
+	}
+	switch code {
+	case http.StatusAccepted:
+	case http.StatusNotFound:
+		// 两种 404：任务名不在白名单（JSON 信封）/ admin 开关没开（mux 纯文本 404）。
+		// 都不该靠猜，把原文与可用任务名一并给出。
+		return fmt.Errorf("404：%s（任务名不存在，或 admin.enabled 未开启；可用：%s）",
+			firstLine(raw), strings.Join(adminTaskNames, " / "))
+	case http.StatusConflict:
+		return fmt.Errorf("409：%s（该任务已有一趟在跑，等它跑完再触发）", firstLine(raw))
+	case http.StatusServiceUnavailable:
+		return fmt.Errorf("503：%s（网关侧未接线，属部署问题）", firstLine(raw))
+	case http.StatusUnauthorized:
+		return fmt.Errorf("401：api_key 不对（检查 config.json 的 api_key）")
+	default:
+		return fmt.Errorf("%d: %s", code, firstLine(raw))
+	}
+	fmt.Printf("已受理：%s 已在网关后台开跑（进度看网关日志）\n", name)
 	return nil
 }
 

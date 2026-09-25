@@ -213,6 +213,9 @@ func main() {
 		AdminEnabled: cfg.Admin.Enabled,
 		// Prometheus 指标端点开关（config metrics.enabled，默认 false）。
 		MetricsEnabled: cfg.Metrics.Enabled,
+		// 手动任务触发（admin.enabled 下的 /admin/tasks/{name}/run）：把调度器
+		// 作为 TaskRunner 注入，server 包不必反向 import scheduler。
+		Tasks: sch,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

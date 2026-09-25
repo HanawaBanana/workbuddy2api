@@ -56,6 +56,11 @@ type Config struct {
 	// 关闭时 /metrics 不注册（同 AdminEnabled 的条件注册理由：不向未鉴权探测暴露
 	// "这里有个指标面"）。开启后走 withAuth，与 /status、/v1/stats 同鉴权口径。
 	MetricsEnabled bool
+
+	// Tasks 手动触发排程任务的实现（admin_tasks.go）。nil = 未接线，此时
+	// /admin/tasks/* 回 503（不静默 404——"配置开了但没接线"要让运维看见）。
+	// 复用 admin.enabled 开关，不单开配置键：它只是账号管理端点的一个动作。
+	Tasks TaskRunner
 }
 
 // notFoundCooldown 上游 404 的固定短冷却时长。
@@ -90,6 +95,12 @@ type Handler struct {
 	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
 	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
 	wafIP wafIPGate
+	// taskMu/taskRunning 手动任务触发的防重入闸（admin_tasks.go）：任务名 →
+	// 是否已有一次手动触发在跑。只挡「手动 vs 手动」连点；「手动 vs 定时」撞车
+	// 由 scheduler 自己的 checkinMu 兜。进程内状态、重启清零——重启后没有在跑的
+	// 手动任务，清零即正确，无需持久化。
+	taskMu      sync.Mutex
+	taskRunning map[string]bool
 }
 
 // NewHandler 构建 handler。
@@ -106,7 +117,7 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.PromptMode == "" {
 		cfg.PromptMode = "passthrough" // 缺省 passthrough：透传客户端原始 system
 	}
-	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
+	h := &Handler{cfg: cfg, mux: http.NewServeMux(), taskRunning: map[string]bool{}}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
@@ -122,6 +133,9 @@ func NewHandler(cfg Config) *Handler {
 		h.mux.HandleFunc("POST /admin/accounts/{uid}/disable", h.withAuth(h.adminAccountDisable))
 		h.mux.HandleFunc("POST /admin/accounts/{uid}/enable", h.withAuth(h.adminAccountEnable))
 		h.mux.HandleFunc("POST /admin/accounts/{uid}/revive", h.withAuth(h.adminAccountRevive))
+		// 手动触发排程任务（admin_tasks.go）：错过整点窗口时人工补跑一次，
+		// 不必等下一个整点。异步受理（202），同一任务在跑时回 409。
+		h.mux.HandleFunc("POST /admin/tasks/{name}/run", h.withAuth(h.adminTaskRun))
 	}
 	// Prometheus 指标端点（默认关闭，config metrics.enabled 开启后生效）。
 	// 与 admin 同用条件注册：未开启时路径不存在，未鉴权探测无法区分它与真 404。
