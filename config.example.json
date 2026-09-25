@@ -34,7 +34,8 @@
     "keepalive_enabled": true,
     "school_enabled": true,
     "cat_enabled": true,
-    "jitter_minutes": 0
+    "jitter_minutes": 0,
+    "jitter_salt": ""
   },
   "admin": {
     "enabled": false,

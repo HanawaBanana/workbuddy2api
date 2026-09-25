@@ -34,6 +34,9 @@ type Config struct {
 	// **确定性**偏移，把「所有部署都在整点同一秒打上游」摊开，对 WAF 友好。
 	// 0/缺省 = 不加偏移（精确整点，与引入前逐字一致）。
 	JitterMinutes int
+	// JitterSalt 实例盐：参与抖动偏移散列，让**同配置的不同部署**算出不同偏移。
+	// 缺省空串 = 散列输入与引入本字段之前逐字一致（零行为变化）。
+	JitterSalt string
 	// ActivityReportCount 每号每次活跃上报的条数：领猫前置需 5 次对话，
 	// 默认 5 条同一 conversationId 内多轮上报把 chat_5 刷满；0/缺省=1 兼容旧行为。
 	ActivityReportCount int
@@ -140,7 +143,11 @@ var ErrBusy = errors.New("checkin already running")
 //
 // 散列用 FNV-1a：标准库自带、无状态、不引 math/rand 全局种子（那会让结果依赖调用
 // 顺序）。语义与 internal/server 的 jitterDur（±25% 时长缩放、随机）不同，故不复用。
-func jitterOffset(kind taskKind, nominal time.Time, jitterMinutes int) time.Duration {
+// salt 为空串时散列输入与引入盐之前逐字一致（零行为变化）；非空则参与散列，使
+// **同配置的不同部署**错开——默认种子只有「任务类 + 名义时点」，不含任何实例身份，
+// 所有部署在同一任务/同一天/同一小时会算出完全相同的偏移（整点齐发只是被平移成一个
+// 固定的新齐发时刻），对"摊开全网负载"没有效果。盐由配置 schedule.jitter_salt 提供。
+func jitterOffset(kind taskKind, nominal time.Time, jitterMinutes int, salt string) time.Duration {
 	if jitterMinutes <= 0 {
 		return 0 // 0/负数 = 不加偏移（旧行为）
 	}
@@ -150,6 +157,9 @@ func jitterOffset(kind taskKind, nominal time.Time, jitterMinutes int) time.Dura
 		return 0
 	}
 	h := fnv.New32a()
+	if salt != "" { // 留空时内容与顺序同上游，保证零行为变化
+		_, _ = fmt.Fprintf(h, "%s|", salt)
+	}
 	// 名义时点用「日期 + 小时」参与散列：同一天同一小时的偏移固定，换一天则变。
 	_, _ = fmt.Fprintf(h, "%s|%s", kind, nominal.Format("2006-01-02T15"))
 	return time.Duration(int64(h.Sum32())%secs) * time.Second
@@ -161,14 +171,14 @@ func jitterOffset(kind taskKind, nominal time.Time, jitterMinutes int) time.Dura
 // 名义时点派生），用于把整点齐发的负载摊开。偏移只在**定下日期之后**施加：先算
 // 今天的名义时点、加偏移、若已过则改用明天的名义时点重新算偏移——否则跨日时
 // 偏移会串到错误的日期上。
-func nextFire(now time.Time, hours []int, kind taskKind, jitterMinutes int) time.Time {
+func nextFire(now time.Time, hours []int, kind taskKind, jitterMinutes int, salt string) time.Time {
 	var earliest time.Time
 	for _, h := range hours {
 		// 先试今天，过了再试明天（最多两天足够：明天同一小时必然在 now 之后）。
 		for d := 0; d < 2; d++ {
 			nominal := time.Date(now.Year(), now.Month(), now.Day(), h, 0, 0, 0, now.Location()).
 				AddDate(0, 0, d)
-			t := nominal.Add(jitterOffset(kind, nominal, jitterMinutes))
+			t := nominal.Add(jitterOffset(kind, nominal, jitterMinutes, salt))
 			if !t.After(now) {
 				continue
 			}
@@ -224,22 +234,22 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	var slots []slot
 	jit := s.cfg.JitterMinutes
 	if !s.cfg.CheckinDisabled {
-		slots = append(slots, slot{nextFire(now, s.cfg.CheckinHours, taskCheckin, jit), taskCheckin})
+		slots = append(slots, slot{nextFire(now, s.cfg.CheckinHours, taskCheckin, jit, s.cfg.JitterSalt), taskCheckin})
 	}
 	if !s.cfg.TravelDisabled {
-		slots = append(slots, slot{nextFire(now, s.cfg.TravelHours, taskTravel, jit), taskTravel})
+		slots = append(slots, slot{nextFire(now, s.cfg.TravelHours, taskTravel, jit, s.cfg.JitterSalt), taskTravel})
 	}
 	if !s.cfg.ActivityDisabled {
-		slots = append(slots, slot{nextFire(now, s.cfg.ActivityHours, taskActivity, jit), taskActivity})
+		slots = append(slots, slot{nextFire(now, s.cfg.ActivityHours, taskActivity, jit, s.cfg.JitterSalt), taskActivity})
 	}
 	if !s.cfg.KeepaliveDisabled {
-		slots = append(slots, slot{nextFire(now, s.cfg.KeepaliveHours, taskKeepalive, jit), taskKeepalive})
+		slots = append(slots, slot{nextFire(now, s.cfg.KeepaliveHours, taskKeepalive, jit, s.cfg.JitterSalt), taskKeepalive})
 	}
 	if !s.cfg.SchoolDisabled {
-		slots = append(slots, slot{nextFire(now, s.cfg.SchoolHours, taskSchool, jit), taskSchool})
+		slots = append(slots, slot{nextFire(now, s.cfg.SchoolHours, taskSchool, jit, s.cfg.JitterSalt), taskSchool})
 	}
 	if !s.cfg.CatDisabled {
-		slots = append(slots, slot{nextFire(now, s.cfg.CatHours, taskCat, jit), taskCat})
+		slots = append(slots, slot{nextFire(now, s.cfg.CatHours, taskCat, jit, s.cfg.JitterSalt), taskCat})
 	}
 	var earliest time.Time
 	for _, sl := range slots {

@@ -145,8 +145,8 @@ func TestJitterDiffersByTaskKind(t *testing.T) {
 	})
 	now := time.Date(2026, 9, 25, 0, 0, 0, 0, time.Local)
 
-	checkin := nextFire(now, s.cfg.CheckinHours, taskCheckin, s.cfg.JitterMinutes)
-	travel := nextFire(now, s.cfg.TravelHours, taskTravel, s.cfg.JitterMinutes)
+	checkin := nextFire(now, s.cfg.CheckinHours, taskCheckin, s.cfg.JitterMinutes, "")
+	travel := nextFire(now, s.cfg.TravelHours, taskTravel, s.cfg.JitterMinutes, "")
 	if checkin.Equal(travel) {
 		t.Fatalf("不同任务类不应得到同一偏移（否则没起到摊开作用）：都是 %v", checkin)
 	}
@@ -166,7 +166,7 @@ func TestJitterVariesByDay(t *testing.T) {
 	seen := map[time.Duration]bool{}
 	for d := 0; d < 40; d++ {
 		day := time.Date(2026, 9, 1, 0, 0, 0, 0, time.Local).AddDate(0, 0, d)
-		at := nextFire(day, []int{9}, taskCheckin, jitter)
+		at := nextFire(day, []int{9}, taskCheckin, jitter, "")
 		nominal := time.Date(day.Year(), day.Month(), day.Day(), 9, 0, 0, 0, time.Local)
 		seen[at.Sub(nominal)] = true
 	}
@@ -178,16 +178,48 @@ func TestJitterVariesByDay(t *testing.T) {
 // TestJitterOffsetHelperEdges jitterOffset 的边界：0/负 = 0；正值落在 [0,N) 分钟。
 func TestJitterOffsetHelperEdges(t *testing.T) {
 	nominal := time.Date(2026, 9, 25, 9, 0, 0, 0, time.Local)
-	if got := jitterOffset(taskCheckin, nominal, 0); got != 0 {
+	if got := jitterOffset(taskCheckin, nominal, 0, ""); got != 0 {
 		t.Fatalf("jitterMinutes=0 应为 0，got %v", got)
 	}
-	if got := jitterOffset(taskCheckin, nominal, -5); got != 0 {
+	if got := jitterOffset(taskCheckin, nominal, -5, ""); got != 0 {
 		t.Fatalf("负窗口应为 0（不 panic），got %v", got)
 	}
 	for _, n := range []int{1, 15, 60, 1440} {
-		got := jitterOffset(taskCheckin, nominal, n)
+		got := jitterOffset(taskCheckin, nominal, n, "")
 		if got < 0 || got >= time.Duration(n)*time.Minute {
 			t.Fatalf("jitterOffset(n=%d)=%v 超出 [0,%dm)", n, got, n)
 		}
+	}
+}
+
+// TestJitterSaltSeparatesDeployments 实例盐把「同配置的不同部署」错开。
+//
+// 背景：偏移种子原本只有「任务类 + 名义时点」，不含任何实例身份——于是所有部署在
+// 同一任务/同一天/同一小时会算出**同一个**偏移，整点齐发只是被平移成一个固定的
+// 新齐发点，对"摊开全网负载"没有效果。盐为空串时保持逐字兼容；非空时各部署互不相同。
+func TestJitterSaltSeparatesDeployments(t *testing.T) {
+	nominal := time.Date(2026, 9, 26, 9, 0, 0, 0, time.Local)
+
+	// 确定性前提：同一输入（含空盐）必须稳定。
+	if a, b := jitterOffset(taskCheckin, nominal, 10, ""), jitterOffset(taskCheckin, nominal, 10, ""); a != b {
+		t.Fatalf("确定性前提不成立：%v != %v", a, b)
+	}
+
+	seen := map[time.Duration]string{}
+	for _, salt := range []string{"", "deploy-alpha", "deploy-bravo", "deploy-charlie"} {
+		got := jitterOffset(taskCheckin, nominal, 10, salt)
+		if got < 0 || got >= 10*time.Minute {
+			t.Fatalf("salt=%q 偏移 %v 越界 [0,10m)", salt, got)
+		}
+		if prev, dup := seen[got]; dup {
+			t.Errorf("salt=%q 与 %q 算到同一偏移 %v（盐未生效）", salt, prev, got)
+		}
+		seen[got] = salt
+	}
+
+	// 换一天偏移随之改变（与既有确定性语义一致；极小概率撞同值，仅记录）。
+	if jitterOffset(taskCheckin, nominal, 10, "deploy-alpha") ==
+		jitterOffset(taskCheckin, nominal.AddDate(0, 0, 1), 10, "deploy-alpha") {
+		t.Log("同盐跨日落在同一偏移（1/600 概率，非失败）")
 	}
 }
