@@ -41,6 +41,17 @@ type Config struct {
 	// （withAuth + 同一个 api_key，不另立管理密钥）。
 	Admin struct {
 		Enabled bool `json:"enabled"` // 默认 false
+		// AuditEnabled 管理操作审计日志开关。默认**关闭**：审计会在磁盘上额外
+		// 落一份文件，老部署即便开了 admin 也不该被动产生新文件，故与 enabled
+		// 拆成两个开关。开启后 /admin 下每个动作（账号 disable/enable/revive、
+		// 手动触发任务）追加一行 JSONL，含时间/动作/对象/结果/来源 IP 与
+		// api_key 指纹（指纹而非原文）。
+		// 要求 admin.enabled 同时开启——审计的对象就是这些端点，端点不存在时
+		// 开着审计是个只会误导人的空配置，normalize 直接拒绝。
+		AuditEnabled bool `json:"audit_enabled"` // 默认 false
+		// AuditFile 审计日志路径。空 = 内置默认 ./data/admin_audit.log。
+		// 与 state_file 同约定：父目录由进程自建（NewAuditLog 会 MkdirAll）。
+		AuditFile string `json:"audit_file"`
 	} `json:"admin"`
 
 	// Metrics Prometheus 指标端点开关。默认**关闭**：开启后 GET /metrics 暴露
@@ -244,6 +255,10 @@ func Default() *Config {
 	// Metrics.Enabled / Admin.Enabled 缺省 false（零值）：管理面与指标面都不默认暴露，
 	// 老 config 不含这两个键时行为逐字不变。这里显式写出以明示默认值意图。
 	c.Metrics.Enabled = false
+	// 审计同样缺省关闭；路径给默认值（与 state_file 同目录约定）——开关关着时
+	// 该路径是惰性的，写出来只是让 config.example.json 的取值与实现一致。
+	c.Admin.AuditEnabled = false
+	c.Admin.AuditFile = "./data/admin_audit.log"
 	// Alerting 缺省关闭；各阈值/周期给默认值，但 min_healthy_global 与
 	// breaker_threshold 的 0 是"关闭该规则"的哨兵，不能改（见 Config.Alerting 注释）。
 	c.Alerting.IntervalSeconds = 30
@@ -352,6 +367,14 @@ func applyEnv(c *Config) {
 		if b, err := strconv.ParseBool(v); err == nil {
 			c.Admin.Enabled = b
 		}
+	}
+	if v := os.Getenv("WB2A_ADMIN_AUDIT_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Admin.AuditEnabled = b
+		}
+	}
+	if v := os.Getenv("WB2A_ADMIN_AUDIT_FILE"); v != "" {
+		c.Admin.AuditFile = v
 	}
 	if v := os.Getenv("WB2A_METRICS_ENABLED"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
@@ -491,6 +514,19 @@ func (c *Config) normalize() error {
 	// 两条入口最终状态一致拦截。
 	if c.Admin.Enabled && strings.TrimSpace(c.APIKey) == "" {
 		return fmt.Errorf("admin.enabled=true 但 api_key 为空：请设置 api_key 或将 admin.enabled 置 false")
+	}
+	// 审计段的 fail-fast，与上面的 admin 校验并列（同属"开了功能就必须给齐参数"）：
+	//   - audit_enabled=true 而 admin.enabled=false：审计的对象就是 /admin 端点，
+	//     端点不存在时开着审计是个永远不会写一行的空配置——它比报错更危险，因为
+	//     运维会以为"审计已经在跑了"。
+	//   - 路径为空：无从落盘（Default 已给默认值，走到这里说明被显式置空了）。
+	if c.Admin.AuditEnabled {
+		if !c.Admin.Enabled {
+			return fmt.Errorf("admin.audit_enabled=true 但 admin.enabled=false：审计的对象是 /admin 端点，请同时开启 admin.enabled")
+		}
+		if strings.TrimSpace(c.Admin.AuditFile) == "" {
+			return fmt.Errorf("admin.audit_enabled=true 但 admin.audit_file 为空：请填写审计日志路径或将 admin.audit_enabled 置 false")
+		}
 	}
 	// 告警段归一 + fail-fast（enabled=true 且 webhook_url 缺失/非法 → 拒绝启动）。
 	// 位置与上面的 admin 校验并列：两者都是"开了功能就必须给齐参数"的启动期拦截。

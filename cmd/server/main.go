@@ -203,6 +203,20 @@ func main() {
 			cfg.Schedule.JitterMinutes)
 	}
 
+	// 管理操作审计（config admin.audit_enabled，默认关闭）：把 /admin 下每个动作
+	// 追加一行 JSONL 到磁盘。构造期做可写性预检并 fail-fast——路径不可写是审计最
+	// 常见的失效原因，且完全能在启动时发现；放到第一次管理操作才暴露，等于把一次
+	// 「配置错」推迟成「真出事时才发现审计是空的」，那正是审计最没用的时刻。
+	var auditLog *server.AuditLog
+	if cfg.Admin.AuditEnabled {
+		al, err := server.NewAuditLog(cfg.Admin.AuditFile, cfg.APIKey)
+		if err != nil {
+			log.Fatalf("管理操作审计初始化失败：%v", err)
+		}
+		auditLog = al
+		log.Printf("管理操作审计已启用：%s（每个 /admin 动作追加一行 JSONL）", al.Path())
+	}
+
 	h := server.NewHandler(server.Config{
 		Pool:         p,
 		Upstream:     up,
@@ -222,6 +236,9 @@ func main() {
 		// 手动任务触发（admin.enabled 下的 /admin/tasks/{name}/run）：把调度器
 		// 作为 TaskRunner 注入，server 包不必反向 import scheduler。
 		Tasks: sch,
+		// 管理操作审计接收器（admin.audit_enabled，默认关闭时为零值 nil =
+		// 不审计、零开销）。
+		Audit: auditLog,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

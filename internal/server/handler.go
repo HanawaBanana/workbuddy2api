@@ -61,6 +61,13 @@ type Config struct {
 	// /admin/tasks/* 回 503（不静默 404——"配置开了但没接线"要让运维看见）。
 	// 复用 admin.enabled 开关，不单开配置键：它只是账号管理端点的一个动作。
 	Tasks TaskRunner
+
+	// Audit 管理操作审计接收器（admin_audit.go）。nil = 不审计。
+	//
+	// 与 AdminEnabled 拆成两个开关：审计是「额外落一份磁盘文件」，老部署开了
+	// admin 也不该被动多出一个文件，故 config admin.audit_enabled 缺省关闭。
+	// 由 main 在启动期构造（NewAuditLog 会做可写性预检并 fail-fast）。
+	Audit *AuditLog
 }
 
 // notFoundCooldown 上游 404 的固定短冷却时长。
@@ -130,12 +137,19 @@ func NewHandler(cfg Config) *Handler {
 	// 区分——路由一旦注册，"带 key 得 401 / GET 得 405 / JSON 信封 404" 三者都会
 	// 暴露管理面存在。
 	if cfg.AdminEnabled {
-		h.mux.HandleFunc("POST /admin/accounts/{uid}/disable", h.withAuth(h.adminAccountDisable))
-		h.mux.HandleFunc("POST /admin/accounts/{uid}/enable", h.withAuth(h.adminAccountEnable))
-		h.mux.HandleFunc("POST /admin/accounts/{uid}/revive", h.withAuth(h.adminAccountRevive))
+		// 四条路由都包一层审计（config admin.audit_enabled，缺省关闭时 audit 是
+		// 直通、零开销）。审计在 withAuth **之内**：未通过鉴权的探测不落盘，
+		// 免得给匿名方一个「写运维磁盘」的口子（见 admin_audit.go 的 audit 注释）。
+		h.mux.HandleFunc("POST /admin/accounts/{uid}/disable",
+			h.withAuth(h.audit("account.disable", auditPathValue("uid"), h.adminAccountDisable)))
+		h.mux.HandleFunc("POST /admin/accounts/{uid}/enable",
+			h.withAuth(h.audit("account.enable", auditPathValue("uid"), h.adminAccountEnable)))
+		h.mux.HandleFunc("POST /admin/accounts/{uid}/revive",
+			h.withAuth(h.audit("account.revive", auditPathValue("uid"), h.adminAccountRevive)))
 		// 手动触发排程任务（admin_tasks.go）：错过整点窗口时人工补跑一次，
 		// 不必等下一个整点。异步受理（202），同一任务在跑时回 409。
-		h.mux.HandleFunc("POST /admin/tasks/{name}/run", h.withAuth(h.adminTaskRun))
+		h.mux.HandleFunc("POST /admin/tasks/{name}/run",
+			h.withAuth(h.audit("task.run", auditPathValue("name"), h.adminTaskRun)))
 	}
 	// Prometheus 指标端点（默认关闭，config metrics.enabled 开启后生效）。
 	// 与 admin 同用条件注册：未开启时路径不存在，未鉴权探测无法区分它与真 404。

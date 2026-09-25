@@ -37,7 +37,9 @@
     "jitter_minutes": 0
   },
   "admin": {
-    "enabled": false
+    "enabled": false,
+    "audit_enabled": false,
+    "audit_file": "./data/admin_audit.log"
   },
   "metrics": {
     "enabled": false
