@@ -51,6 +51,11 @@ type Config struct {
 	// AdminEnabled 运维管理端点开关（config admin.enabled，默认 false）。
 	// 关闭时 /admin/* 一律 404（而非 403——不向外暴露"这里存在管理面"）。
 	AdminEnabled bool
+
+	// MetricsEnabled Prometheus 指标端点开关（config metrics.enabled，默认 false）。
+	// 关闭时 /metrics 不注册（同 AdminEnabled 的条件注册理由：不向未鉴权探测暴露
+	// "这里有个指标面"）。开启后走 withAuth，与 /status、/v1/stats 同鉴权口径。
+	MetricsEnabled bool
 }
 
 // notFoundCooldown 上游 404 的固定短冷却时长。
@@ -117,6 +122,12 @@ func NewHandler(cfg Config) *Handler {
 		h.mux.HandleFunc("POST /admin/accounts/{uid}/disable", h.withAuth(h.adminAccountDisable))
 		h.mux.HandleFunc("POST /admin/accounts/{uid}/enable", h.withAuth(h.adminAccountEnable))
 		h.mux.HandleFunc("POST /admin/accounts/{uid}/revive", h.withAuth(h.adminAccountRevive))
+	}
+	// Prometheus 指标端点（默认关闭，config metrics.enabled 开启后生效）。
+	// 与 admin 同用条件注册：未开启时路径不存在，未鉴权探测无法区分它与真 404。
+	// 数据源全是进程内只读快照，scrape 不触发任何上游请求。
+	if cfg.MetricsEnabled {
+		h.mux.HandleFunc("GET /metrics", h.withAuth(h.promMetrics))
 	}
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	return h

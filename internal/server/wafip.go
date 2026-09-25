@@ -78,3 +78,9 @@ func (g *wafIPGate) active() bool {
 	defer g.mu.Unlock()
 	return time.Now().Before(g.until)
 }
+
+// WAFActive 报告 IP 级 WAF 拦截是否处于激活期（对外只读访问器，供告警监控器取值）。
+//
+// 与 active() 的分工：active() 是状态机内部判定，WAFActive() 是只读出口——
+// alert 包只依赖这一层，不接触状态机内部结构，网关也无需为告警暴露更多内部细节。
+func (h *Handler) WAFActive() bool { return h.wafIP.active() }

@@ -368,31 +368,86 @@ func (p *Pool) CountsDetailedForRealm(realm string) (total, healthy, cooling, di
 }
 
 // countsDetailedForRealm 是两函数共用的遍历实现；realm=="" 不加谓词。
+// 委托 RealmHealth 做实际遍历——两个入口的 5 个字段必须逐字同口径，
+// 分开实现迟早漂移（原实现与 RealmHealth 若各写一份 switch，改一处忘另一处
+// 会让 /status 与 /metrics 报出不一致的账号数，运维据此误判池健康）。
 func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, disabled, inFlightFull int) {
+	h := p.RealmHealth(realm)
+	return h.Total, h.Healthy, h.Cooling, h.Disabled, h.InFlightFull
+}
+
+// RealmHealth 单 realm 的健康度分解（供 /metrics 只读导出）。
+//
+// 设计纪律：**纯现算，不新增累加器**。全部字段由 entry 现有字段在调用时刻算出，
+// 因此不存在"第二份状态"与随之而来的双写一致性风险。Total/Healthy/Cooling/
+// Disabled/InFlightFull 五字段与 CountsDetailed(ForRealm) 逐字同口径（后者已委托
+// 本方法），另拆出四个**细分维度**供告警与看板使用：
+//
+//   - Breaker/Degraded 是"为什么在冷却"的原因分解，与 Cooling 有交集（一个熔断中
+//     的账号既计入 Cooling 也计入 Breaker）；禁用账号若残留 breakerUntil 也计入
+//     Breaker（disableLocked 刻意保留熔断器，见 transition.go）。
+//   - ManualDisabled 是 Disabled 的子集，供区分"运维摘除"与"系统判死"。
+//   - ModelCooled 是存在**未过期**模型级冷却的账号数（6004/11102），与账号级
+//     健康正交——这类账号对触发模型不可用、对其他模型仍可选（issue #31）。
+//   - InFlight 是各账号在途请求数之和（运行态观测，不参与任何判定）。
+//
+// realm=="" 退化为全池（现状语义）。调用方无需持锁。
+type RealmHealth struct {
+	Total          int
+	Healthy        int
+	Cooling        int
+	Disabled       int
+	InFlightFull   int
+	Breaker        int
+	Degraded       int
+	ManualDisabled int
+	ModelCooled    int
+	InFlight       int
+}
+
+// RealmHealth 返回指定 realm 的健康度分解；realm=="" 统计全池。
+func (p *Pool) RealmHealth(realm string) RealmHealth {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()
+	var h RealmHealth
 	for _, e := range p.byUID {
 		if realm != "" && e.a.Realm() != realm {
 			continue
 		}
-		total++
+		h.Total++
 		switch {
 		// 手动停用与自动禁用同归 disabled 计数：对「多少号不参与选号」这个运维
 		// 问题二者等价，分开会让 total/healthy/cooling/disabled 不闭合。
 		// 具体是哪一种看 /status 账号级的 manual_disabled/disabled 两位。
 		case e.disabled || e.manualDisabled:
-			disabled++
+			h.Disabled++
 		case !e.healthy(now):
-			cooling++
+			h.Cooling++
 		default:
-			healthy++
+			h.Healthy++
 			if p.inFlightFull(e) {
-				inFlightFull++
+				h.InFlightFull++
 			}
 		}
+		if e.manualDisabled {
+			h.ManualDisabled++
+		}
+		if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
+			h.Breaker++
+		}
+		if !e.degradeUntil.IsZero() && now.Before(e.degradeUntil) {
+			h.Degraded++
+		}
+		for _, mc := range e.modelCooldowns {
+			if !mc.Until.IsZero() && now.Before(mc.Until) {
+				h.ModelCooled++
+				break
+			}
+		}
+		h.InFlight += int(e.inFlight.Load())
 	}
-	return total, healthy, cooling, disabled, inFlightFull
+	return h
 }
 
 // ServableNow 报告池当前是否可服务：存在至少一个（对任意模型）healthy 且未占满在途名额的账号。

@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"workbuddy2api/internal/alert"
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/redisstore"
@@ -210,11 +211,41 @@ func main() {
 		GlobalEnabled: cfg.Global.Enabled,
 		// 运维管理端点开关（config admin.enabled，默认 false）。
 		AdminEnabled: cfg.Admin.Enabled,
+		// Prometheus 指标端点开关（config metrics.enabled，默认 false）。
+		MetricsEnabled: cfg.Metrics.Enabled,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go sch.Run(ctx)
+
+	// 可用性阈值告警（config alerting.enabled，默认关闭）：独立 ticker 评估只读健康
+	// 快照，越界时 POST 到运维自备的 webhook。与请求路径完全隔离，且从不调用上游。
+	alertMon := alert.New(alert.Config{
+		Enabled:          cfg.Alerting.Enabled,
+		WebhookURL:       cfg.Alerting.WebhookURL,
+		Secret:           cfg.Alerting.Secret,
+		Interval:         time.Duration(cfg.Alerting.IntervalSeconds) * time.Second,
+		Timeout:          time.Duration(cfg.Alerting.TimeoutSeconds) * time.Second,
+		StartupGrace:     time.Duration(cfg.Alerting.StartupGraceSeconds) * time.Second,
+		MinHealthyCN:     cfg.Alerting.MinHealthyCN,
+		MinHealthyGlobal: cfg.Alerting.MinHealthyGlobal,
+		RecoverHealthy:   cfg.Alerting.RecoverHealthy,
+		BreakerThreshold: cfg.Alerting.BreakerThreshold,
+		ForTicks:         cfg.Alerting.ForTicks,
+		ClearTicks:       cfg.Alerting.ClearTicks,
+		SendResolve:      cfg.Alerting.SendResolve,
+		ServiceName:      server.ServiceName,
+	}, alertSource{pool: p, h: h})
+	go alertMon.Run(ctx)
+	defer alertMon.Stop()
+	if !cfg.Alerting.Enabled {
+		log.Printf("可用性告警已禁用（alerting.enabled=false）")
+	} else {
+		log.Printf("可用性告警已启用：每 %ds 评估，健康阈值 cn=%d / global=%d（0=关闭该规则），熔断阈值=%d（0=关闭）",
+			cfg.Alerting.IntervalSeconds, cfg.Alerting.MinHealthyCN,
+			cfg.Alerting.MinHealthyGlobal, cfg.Alerting.BreakerThreshold)
+	}
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,

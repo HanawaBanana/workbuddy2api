@@ -38,6 +38,24 @@
   "admin": {
     "enabled": false
   },
+  "metrics": {
+    "enabled": false
+  },
+  "alerting": {
+    "enabled": false,
+    "webhook_url": "",
+    "secret": "",
+    "interval_seconds": 30,
+    "timeout_seconds": 5,
+    "startup_grace_seconds": 30,
+    "min_healthy_cn": 1,
+    "min_healthy_global": 0,
+    "recover_healthy": 1,
+    "breaker_threshold": 0,
+    "for_ticks": 2,
+    "clear_ticks": 2,
+    "send_resolve": false
+  },
   "global": {
     "enabled": true,
     "chat_base": "",
