@@ -158,12 +158,17 @@ func main() {
 		// 触发时刻抖动窗口（schedule.jitter_minutes，0 = 精确整点 = 旧行为）。
 		JitterMinutes:      cfg.Schedule.JitterMinutes,
 		ExpiringSoonWindow: cfg.ExpiringSoonDur, // 快过期积分优先消耗（issue:积分过期）
-		CheckinDisabled:    !cfg.Schedule.CheckinEnabled,
-		TravelDisabled:     !cfg.Schedule.TravelEnabled,
-		ActivityDisabled:   !cfg.Schedule.ActivityEnabled,
-		KeepaliveDisabled:  !cfg.Schedule.KeepaliveEnabled,
-		SchoolDisabled:     !cfg.Schedule.SchoolEnabled,
-		CatDisabled:        !cfg.Schedule.CatEnabled,
+		// 任务执行台账与当日失败重试（schedule.ledger_file / retry_*）。
+		// 重试默认关闭（RetryDelayMinutes=0），台账恒在（纯内存，除非给了落盘路径）。
+		LedgerFile:        cfg.Schedule.LedgerFile,
+		RetryDelayMinutes: cfg.Schedule.RetryDelayMinutes,
+		RetryMaxPerDay:    cfg.Schedule.RetryMaxPerDay,
+		CheckinDisabled:   !cfg.Schedule.CheckinEnabled,
+		TravelDisabled:    !cfg.Schedule.TravelEnabled,
+		ActivityDisabled:  !cfg.Schedule.ActivityEnabled,
+		KeepaliveDisabled: !cfg.Schedule.KeepaliveEnabled,
+		SchoolDisabled:    !cfg.Schedule.SchoolEnabled,
+		CatDisabled:       !cfg.Schedule.CatEnabled,
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
@@ -201,6 +206,21 @@ func main() {
 	if cfg.Schedule.JitterMinutes > 0 {
 		log.Printf("排程抖动已启用：各任务触发时刻在名义整点后 0-%d 分钟内确定性偏移（schedule.jitter_minutes）",
 			cfg.Schedule.JitterMinutes)
+	}
+	// 任务执行台账与当日失败重试（schedule.ledger_file / retry_*）。
+	// 台账恒在（内存），落盘与否取决于 ledger_file；重试默认关闭。
+	if cfg.Schedule.LedgerFile != "" {
+		log.Printf("任务执行台账已落盘：%s（每类任务一轮执行后覆写，重启后仍可对账；实时视图见 /status 的 task_ledger）",
+			cfg.Schedule.LedgerFile)
+	} else {
+		log.Printf("任务执行台账仅在内存（schedule.ledger_file 为空，重启后只剩新跑过的记录）")
+	}
+	if cfg.Schedule.RetryDelayMinutes > 0 && cfg.Schedule.RetryMaxPerDay > 0 {
+		log.Printf("当日失败重试已启用：某类任务一轮「全灭」（有失败且无任何账号做成）后 %d 分钟补跑，每类每日最多 %d 次（schedule.retry_delay_minutes / retry_max_per_day）",
+			cfg.Schedule.RetryDelayMinutes, cfg.Schedule.RetryMaxPerDay)
+	} else {
+		log.Printf("当日失败重试已关闭（schedule.retry_delay_minutes=%d retry_max_per_day=%d；全灭只记 WARN 与台账，不自动补跑）",
+			cfg.Schedule.RetryDelayMinutes, cfg.Schedule.RetryMaxPerDay)
 	}
 
 	// 管理操作审计（config admin.audit_enabled，默认关闭）：把 /admin 下每个动作
@@ -247,6 +267,10 @@ func main() {
 		Audit: auditLog,
 		// 当日积分预算上限（budget.daily_credit_limit，0 = 关闭该闸）。
 		BudgetLimit: cfg.Budget.DailyCreditLimit,
+		// 任务执行台账只读视图（/status 的 task_ledger 段 + /metrics 的任务指标）。
+		// 与 Tasks 同款：*taskledger.Store 结构上即满足 server 侧的窄接口，
+		// server 包不必反向 import scheduler。
+		TaskLedger: sch.Ledger(),
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

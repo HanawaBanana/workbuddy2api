@@ -398,6 +398,21 @@ func applyEnv(c *Config) {
 			c.Budget.DailyCreditLimit = f
 		}
 	}
+	// 排程段的台账与当日失败重试（schedule.*）。三个键都进 env：容器部署改这一组
+	// 往往只为「补跑一次」或「把台账落到卷上」，不该逼着用户去改挂载的 config.json。
+	if v := os.Getenv("WB2A_SCHEDULE_LEDGER_FILE"); v != "" {
+		c.Schedule.LedgerFile = v
+	}
+	if v := os.Getenv("WB2A_SCHEDULE_RETRY_DELAY_MINUTES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Schedule.RetryDelayMinutes = n
+		}
+	}
+	if v := os.Getenv("WB2A_SCHEDULE_RETRY_MAX_PER_DAY"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Schedule.RetryMaxPerDay = n
+		}
+	}
 	if v := os.Getenv("WB2A_METRICS_ENABLED"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			c.Metrics.Enabled = b

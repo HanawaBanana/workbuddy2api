@@ -34,7 +34,10 @@
     "keepalive_enabled": true,
     "school_enabled": true,
     "cat_enabled": true,
-    "jitter_minutes": 0
+    "jitter_minutes": 0,
+    "ledger_file": "",
+    "retry_delay_minutes": 0,
+    "retry_max_per_day": 1
   },
   "admin": {
     "enabled": false,

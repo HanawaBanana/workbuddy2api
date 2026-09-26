@@ -48,6 +48,28 @@ type Schedule struct {
 	// 为什么 0 是"关闭"而不是"回落默认"：它是这里的缺省值本身，也是「保持与引入前
 	// 逐字一致」的开关，不是笔误——与 *_enabled 缺省 true 是两回事。
 	JitterMinutes int `json:"jitter_minutes"`
+	// LedgerFile 任务执行台账落盘路径（空 = 纯内存，默认）。
+	//
+	// 台账记每类任务「最近一轮」的结果（总/成功/幂等成功/失败/跳过、是否全灭）
+	// 与当日重试计数，经 /status 的 task_ledger 段与 /metrics 的任务指标透出。
+	// 落盘是为了**重启后还能对账**——服务自动更新/改配置重启后，此前只能看到
+	// 一截日志。空值不落盘：老部署不该被动多出一个文件。
+	//
+	// 落盘失败只记日志、不影响任务执行（观测组件不该拖垮关键路径），因此这里
+	// 不做启动期可写性 fail-fast——与 admin.audit_file 刻意相反：那份是安全特性，
+	// 空着等于安全承诺失效；这份只是少一段历史。
+	LedgerFile string `json:"ledger_file"`
+	// RetryDelayMinutes 当日失败重试延迟（分钟）。**0 = 关闭**（缺省，与引入前逐字一致）。
+	//
+	// 某类任务一轮「全灭」（有失败且没有任何账号做成，见 scheduler.recordRun）
+	// 时，在该延迟后再跑一次。判据刻意不是「失败率超阈值」：只要还有账号成功，
+	// 就说明上游是通的，失败是账号级的，重试只是对同一批注定失败的号再打一遍
+	// 上游（零收益 + 撞风控）；而「一个都没成」几乎只能解释为网络未就绪 / 上游
+	// 抖动 / WAF 拦截——那才是重试能救的。这条同时保证了成功路径零新增上游请求。
+	RetryDelayMinutes int `json:"retry_delay_minutes"`
+	// RetryMaxPerDay 每类任务每日最多重试次数（CST 自然日）。仅
+	// RetryDelayMinutes>0 时生效；**0 = 不允许重试**（哨兵值，normalize 不回落）。
+	RetryMaxPerDay int `json:"retry_max_per_day"`
 	// 猫猫旅行已退役 travel_interval_minutes：旅行现为独立排程（travel_hours）。
 	// 旧 config 里的该键因 JSON 未知字段而自然忽略，不报错。
 }
@@ -57,6 +79,12 @@ type Schedule struct {
 // 开关「缺省 true」靠这里实现：调用方先取 DefaultSchedule 再用 json.Unmarshal 覆盖，
 // 键缺席（或为 null）时字段原样保留 true，只有显式 false 才关。
 // ActivityReportCount 默认 5：领猫前置需 5 次对话，5 连发刷满 chat_5。
+//
+// RetryDelayMinutes 默认 0 = 当日失败重试关闭（老 config 行为逐字不变）；
+// RetryMaxPerDay 默认 1——它在开关关着时是惰性的，一旦用户只写了 delay，就自动
+// 得到「每天最多补跑一次」这个最保守也最有用的取值（与 ActivityReportCount 的
+// 「缺省 5」同一套路：靠 Unmarshal 前先置默认值实现，键缺席才保留）。
+// LedgerFile 默认空 = 不落盘（老部署不该被动多出一个文件）。
 func DefaultSchedule() Schedule {
 	return Schedule{
 		CheckinHours:        []int{9, 21},
@@ -72,6 +100,7 @@ func DefaultSchedule() Schedule {
 		SchoolEnabled:       true,
 		CatEnabled:          true,
 		ActivityReportCount: 5, // 领猫前置需 5 次对话，5 连发刷满 chat_5
+		RetryMaxPerDay:      1, // 只写了 retry_delay_minutes 时的保守默认：每天补跑一次
 	}
 }
 
@@ -85,6 +114,10 @@ func DefaultSchedule() Schedule {
 // 「缺省 = 5」由 DefaultSchedule 在 Unmarshal 前置入，是另一条路径，两者不合并。
 //
 // JitterMinutes：0 = 关闭（缺省，保持精确整点）；负值/超上限直接报错，不静默回落。
+//
+// RetryDelayMinutes：0 = 关闭（缺省，与引入前逐字一致）；负值/超上限报错。
+// RetryMaxPerDay：0 = 不允许重试（合法哨兵，不回落）；负值报错；缺省 1 由
+// DefaultSchedule 前置入。LedgerFile 不校验——台账落盘失败只记日志，不做 fail-fast。
 func (s *Schedule) Normalize() error {
 	if len(s.CheckinHours) == 0 {
 		s.CheckinHours = []int{9, 21}
@@ -118,6 +151,21 @@ func (s *Schedule) Normalize() error {
 	if s.JitterMinutes > 1440 {
 		return fmt.Errorf("schedule.jitter_minutes: %d 过大（上限 1440 分钟 = 一天）；"+
 			"抖动窗口必须小于 24h，否则当天那次任务会被整体推到次日", s.JitterMinutes)
+	}
+	// RetryDelayMinutes：0 = 关闭（缺省，行为与引入前一致）；负值报错（无合理语义）。
+	// 上限 1440：延迟 >= 24h 必然跨到次日，那时 taskledger 会判 next_day 而不排期
+	// （「当日失败重试」的语义止于当日），配置即等于没写——不如直接报错说清。
+	if s.RetryDelayMinutes < 0 {
+		return fmt.Errorf("schedule.retry_delay_minutes: %d 不得为负；0 = 关闭当日失败重试", s.RetryDelayMinutes)
+	}
+	if s.RetryDelayMinutes > 1440 {
+		return fmt.Errorf("schedule.retry_delay_minutes: %d 过大（上限 1440 分钟 = 一天）；"+
+			"延迟 >= 24h 时重试必然跨到次日，会被判为 next_day 而不排期——当日失败重试只在本自然日内补跑", s.RetryDelayMinutes)
+	}
+	// RetryMaxPerDay：**0 = 不允许重试**是合法哨兵（与 alerting.min_healthy_* 同风格），
+	// 不回落、不报错；只有负值报错。缺省 1 由 DefaultSchedule 在 Unmarshal 前置入。
+	if s.RetryMaxPerDay < 0 {
+		return fmt.Errorf("schedule.retry_max_per_day: %d 不得为负；0 = 不允许重试（当日失败重试仍由 retry_delay_minutes 总开关控制）", s.RetryMaxPerDay)
 	}
 	return s.validateHours()
 }

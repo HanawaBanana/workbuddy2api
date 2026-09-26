@@ -74,6 +74,15 @@ type Config struct {
 	// <=0 = 关闭该闸（不限），行为与引入前逐字一致。计数按 CST 自然日重置、
 	// 进程内不落盘（见 budget.go）。
 	BudgetLimit float64
+
+	// TaskLedger 任务执行台账的只读视图（/status 的 task_ledger 段 + /metrics 的
+	// 任务指标）。nil = 未接线，此时两处都不含任务维度——与 Pool/Upstream 的
+	// 接线风格一致，测试可注入假台账。
+	//
+	// 用窄接口而非直接依赖 internal/scheduler：server 包不反向 import scheduler
+	// （理由见 admin_tasks.go 的 TaskRunner 注释）。台账的数据结构与存储放在
+	// internal/taskledger，两个包都只依赖它，不产生环。
+	TaskLedger TaskLedgerReader
 }
 
 // notFoundCooldown 上游 404 的固定短冷却时长。
@@ -241,7 +250,7 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 	budgetUsed, budgetLimit, budgetRejected := h.budget.snapshot()
 	// realm_totals 按域分组的计数汇总（双 realm 并存时运维一眼看到各域可用性）：
 	// 只新增字段，既有 total/healthy/cooling/disabled/in_flight_full 汇总键不变（零回归）。
-	writeJSON(w, http.StatusOK, map[string]any{
+	body := map[string]any{
 		"accounts":       h.cfg.Pool.List(),
 		"total":          total,
 		"healthy":        healthy,
@@ -266,7 +275,13 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 			"rejected": budgetRejected,
 			"day":      cstDay(time.Now()),
 		},
-	})
+	}
+	// task_ledger 六类任务「最近一轮」的结果 + 当日失败重试状态（task_ledger.go）。
+	// 未接线时不写该键（而非写 null）：老部署与测试的响应体形状保持不变。
+	if tl := h.taskLedgerStatus(); tl != nil {
+		body["task_ledger"] = tl
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 // countsMapFrom 把 CountsDetailed 五元组编码为 /status realm_totals 的字段对象。
