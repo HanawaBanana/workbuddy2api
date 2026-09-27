@@ -130,6 +130,17 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容上游网关**，将 ```CodeB
 - 领养联动 / 任务查询：`scripts/task_runner.py`（成长任务一体机，默认 dry-run）
 - 个性化提示词：`prompt.file` 指向自定义提示词文件即整体替换内置默认（`custom`/`append` 模式生效）
 
+
+### 仓库自动化（AI 治理）
+
+仓库的 issue / PR 由 `.github/actions/ai-governance` 自动分级与归并：垃圾检测、README 覆盖检查、
+分类打标、要点提炼、canonical 归并；PR 侧另有关联记录与历史语境评审。AI 后端可用仓库 Secrets
+`AI_BASE_URL` / `AI_API_KEY` / `AI_MODEL` 指向任意 OpenAI 兼容端点。
+
+- **人工重跑**：Actions → AI Governance → Run workflow，填 `issue-number` 或 `pr-number`（二选一）
+  即可对既有内容重跑同一条治理链路；两者都留空时只告警、不做任何处理。
+- **维护者豁免**：`maintainer-exempt`（默认开）让协作者提交的内容跳过归并 / 重开，只保留垃圾检测与分类打标。
+- **先行演练**：`dry-run` 只评论不写入，用于上线前观察判定质量。
 ## 架构总览
 
 ```mermaid
