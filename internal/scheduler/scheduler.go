@@ -544,6 +544,8 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 	}
 	log.Printf("checkin done: total=%d ok=%d already=%d fail=%d skipped=%d",
 		len(statuses), okN, alreadyN, failN, skipN)
+	// 顺带做一次签到活动到期预警（只读探测，不影响签到结果；见 checkin_activity.go）。
+	s.warnCheckinActivity(statuses)
 	return out, nil
 }
 
