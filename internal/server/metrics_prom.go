@@ -5,7 +5,9 @@
 //     （本仓库纪律：仅 go-redis/v9，见 logfmt 与 cmd/stats 的同类声明）。
 //   - **零新增累加器**：所有指标在 scrape 时刻**现算**——请求维度复用
 //     MetricsSnapshotOf()（metrics.go 的单一埋点产物），账号池维度走
-//     Pool.RealmHealth（只读现算），不维护第二份状态，因此不存在双写一致性风险。
+//     Pool.RealmHealth（只读现算），任务维度读 taskledger 的既有台账
+//     （scheduler 写入的同一份，不另存一份累加器），不维护第二份状态，
+//     因此不存在双写一致性风险。
 //   - **零新增上游请求**：全部读进程内状态，scrape 不触发任何网络调用。
 //   - **确定性输出**：模型按字典序、realm/state 按固定序，同一状态下两次抓取
 //     逐字节相等（项目对稳定输出的既有要求，见 List/rateLimitedModelsLocked）。
@@ -21,6 +23,7 @@ import (
 	"strings"
 
 	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/taskledger"
 )
 
 // promRealms 导出顺序固定为 cn → global → all（label, realm 谓词）。
@@ -162,7 +165,7 @@ func promPoolStateValue(h pool.RealmHealth, state string) int {
 
 // writePromMetrics 生成完整 exposition 文本。纯函数（无 IO、无时间读取），
 // 便于测试用固定输入做逐行断言。
-func writePromMetrics(snap MetricsSnapshot, health []promRealmHealth, stickySessions int, costExploreEvents int64, wafActive bool) string {
+func writePromMetrics(snap MetricsSnapshot, health []promRealmHealth, stickySessions int, costExploreEvents int64, wafActive bool, tasks map[string]taskledger.Run) string {
 	w := newPromWriter()
 
 	// ---------- 账号池（realm 维度） ----------
@@ -191,6 +194,40 @@ func writePromMetrics(snap MetricsSnapshot, health []promRealmHealth, stickySess
 
 	w.family("wb2api_waf_ip_block_active", "IP 级 WAF 拦截是否处于激活期（1=激活）。进程内状态，重启清零。", "gauge")
 	w.sample("wb2api_waf_ip_block_active", boolToFloat(wafActive))
+
+	// ---------- 定时任务台账（taskledger） ----------
+	//
+	// 只为**跑过至少一轮**的任务输出序列，不补 0 时刻的占位序列：从未跑过的任务
+	// 没有序列，而不是「时刻为 0」——否则服务刚启动 / 台账刚清空时，
+	// `time() - wb2api_task_last_run_timestamp_seconds > 86400` 这类告警会在
+	// 每次部署时误报一轮。反过来，某类任务跑过之后停跑，它的 ts 会一直变旧，
+	// 告警照常触发——这正是要抓的情形。
+	//
+	// 任务名维度固定顺序（promTaskKinds），保证同一状态下两次抓取逐字节相等。
+	ranKinds := make([]string, 0, len(promTaskKinds))
+	for _, kind := range promTaskKinds {
+		if _, ok := tasks[kind]; ok {
+			ranKinds = append(ranKinds, kind)
+		}
+	}
+	if len(ranKinds) > 0 {
+		w.family("wb2api_task_last_run_timestamp_seconds", "各类定时任务最近一轮的结束时刻（Unix 秒）。序列缺失表示该类任务尚未跑过，不是「时刻为 0」——告警规则用 absent() 或先确认序列存在。", "gauge")
+		for _, kind := range ranKinds {
+			w.sample("wb2api_task_last_run_timestamp_seconds", float64(tasks[kind].Finished.Unix()), "kind", kind)
+		}
+
+		w.family("wb2api_task_last_run_accounts", "各类定时任务最近一轮的计数分解：total=本轮涉及量，ok=做成，already=幂等成功（如今天已签到），fail=上游报错，skipped=有意跳过（禁用号/无凭证/global/门槛未达/在途）。", "gauge")
+		for _, kind := range ranKinds {
+			for _, res := range promTaskResults {
+				w.sample("wb2api_task_last_run_accounts", float64(promTaskResultValue(tasks[kind], res)), "kind", kind, "result", res)
+			}
+		}
+
+		w.family("wb2api_task_last_run_all_failed", "各类定时任务最近一轮是否「全灭」（有失败且没有任何账号做成，1=是）。判据刻意不是失败率：还有账号成功就说明上游是通的，失败是账号级的。为 1 且未启用重试时应告警。", "gauge")
+		for _, kind := range ranKinds {
+			w.sample("wb2api_task_last_run_all_failed", boolToFloat(tasks[kind].AllFailed), "kind", kind)
+		}
+	}
 
 	since := float64(0)
 	if !snap.Since.IsZero() {
@@ -281,6 +318,12 @@ func (h *Handler) promMetrics(w http.ResponseWriter, r *http.Request) {
 		exploreEvents, _ = h.cfg.Pool.CostExploreStatus()
 	}
 
+	// 任务台账：未接线（nil）时传 nil map，任务指标整段不输出。
+	var tasks map[string]taskledger.Run
+	if h.cfg.TaskLedger != nil {
+		tasks = h.cfg.TaskLedger.Runs()
+	}
+
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	_, _ = w.Write([]byte(writePromMetrics(snap, health, sticky, exploreEvents, h.wafIP.active())))
+	_, _ = w.Write([]byte(writePromMetrics(snap, health, sticky, exploreEvents, h.wafIP.active(), tasks)))
 }

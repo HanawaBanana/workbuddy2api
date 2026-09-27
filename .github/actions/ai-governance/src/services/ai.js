@@ -47,7 +47,59 @@ function createResponseError(message, code, details) {
   return error;
 }
 
+/**
+ * 可疑响应体的可读预览：非 JSON 的 2xx（例如端点被中间层替换成 `OK` 文本）时，
+ * openai SDK 会把原始响应体原样返回；这里截断成日志可读的一小段。
+ */
+function previewResponse(response, limit = 200) {
+  let text;
+  try {
+    text = typeof response === 'string' ? response : JSON.stringify(response);
+  } catch (_error) {
+    text = String(response);
+  }
+  const flat = String(text === undefined || text === null ? '' : text).replace(/\s+/g, ' ').trim();
+  return flat.length > limit ? `${flat.slice(0, limit)}…` : flat;
+}
+
+/**
+ * 从 chat.completions 响应里取正文。
+ * openai SDK 4.x 收到非 JSON 的 2xx 响应时会把响应体当字符串返回，此时
+ * `response.choices[0]` 抛 `TypeError: Cannot read properties of undefined (reading '0')`
+ * —— 真实原因（端点被拦截 / 返回非 OpenAI 兼容内容）被完全掩盖，治理链路只会
+ * 退化成「AI 服务不可用」的 fail-open 评论。这里显式校验形状，并把可疑响应体写进
+ * 错误信息，便于直接从 Action 日志定位。形状正常而正文为空时保持既有语义
+ * （返回 undefined，交由上层空值检查兜底）。
+ */
+function readChatCompletionContent(response) {
+  if (!response || typeof response !== 'object') {
+    throw createResponseError(
+      `AI 端点返回了非 JSON 响应（可疑响应体：${previewResponse(response)}）`,
+      'non_json_ai_response',
+      previewResponse(response)
+    );
+  }
+  if (!Array.isArray(response.choices)) {
+    throw createResponseError(
+      `AI 响应缺少 choices 字段（疑似端点非 OpenAI 兼容或被中间层拦截），原始响应：${previewResponse(response)}`,
+      'malformed_ai_response',
+      response
+    );
+  }
+  return response.choices[0] && response.choices[0].message
+    ? response.choices[0].message.content
+    : undefined;
+}
+
 function getResponsesText(response) {
+  if (!response || typeof response !== 'object') {
+    throw createResponseError(
+      `Responses API 返回了非 JSON 响应（可疑响应体：${previewResponse(response)}）`,
+      'non_json_ai_response',
+      previewResponse(response)
+    );
+  }
+
   if (response.status === 'failed') {
     throw createResponseError(
       response.error?.message || 'Responses API request failed',
@@ -133,7 +185,7 @@ async function callAI(openai, aiModel, request, config, purpose = 'AI调用', no
         max_tokens: config.ai_settings.max_tokens,
         temperature: config.ai_settings.temperature
       });
-      content = response.choices[0].message.content;
+      content = readChatCompletionContent(response);
     }
 
     if (!content?.trim()) {

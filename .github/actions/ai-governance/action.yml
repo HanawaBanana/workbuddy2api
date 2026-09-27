@@ -14,6 +14,14 @@ inputs:
     description: '治理身份令牌：传入 claude-identity 换票步骤的输出（runner OIDC 向 Anthropic 换来的 Claude App installation token），治理写操作以 claude[bot] 署名；缺省回落 github-token（github-actions[bot]）'
     required: false
     default: ''
+  issue-number:
+    description: 'workflow_dispatch 人工重跑：目标 issue 编号（与 pr-number 二选一；填成 PR 编号会被自动识别为 PR）'
+    required: false
+    default: ''
+  pr-number:
+    description: 'workflow_dispatch 人工重跑：目标 PR 编号（与 issue-number 二选一）'
+    required: false
+    default: ''
   ai-model:
     description: 'AI 模型名'
     required: false
@@ -139,6 +147,8 @@ runs:
         node src/index.js
       env:
         INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}
+        INPUT_ISSUE_NUMBER: ${{ inputs.issue-number }}
+        INPUT_PR_NUMBER: ${{ inputs.pr-number }}
         INPUT_GOVERNANCE_TOKEN: ${{ inputs.governance-token }}
         INPUT_AI_MODEL: ${{ inputs.ai-model }}
         INPUT_LABELS: ${{ inputs.labels }}

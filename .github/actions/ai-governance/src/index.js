@@ -5,6 +5,7 @@ const { loadConfig, parseInputs } = require('./utils/config');
 const { logMessage } = require('./utils/helpers');
 const { handleNewIssue } = require('./handlers/issueHandler');
 const { handleNewPR } = require('./handlers/prHandler');
+const { loadDispatchTarget, readDispatchInputs } = require('./utils/dispatch');
 const { GOVERNANCE_DEFAULTS } = require('./utils/constants');
 
 /**
@@ -117,8 +118,26 @@ async function run() {
       governanceToken
     };
 
-    // 根据事件类型处理
-    if (context.eventName === 'issues' && context.payload.action === 'opened') {
+    // 根据事件类型处理。
+    // workflow_dispatch 是人工重跑入口：dispatch 事件没有 issue / pull_request payload，
+    // 必须显式读输入、按编号取回目标对象，再复用同一条治理链路。此前它直接落到
+    // 「事件类型不匹配，跳过处理」并返回 success，维护者会误读成「治理跑过且无待处理」。
+    if (context.eventName === 'workflow_dispatch') {
+      const target = await loadDispatchTarget(octokit, owner, repo, readDispatchInputs());
+      if (!target) {
+        core.warning('workflow_dispatch 未指定目标：请填写 issue-number 或 pr-number 后重跑（本次不做任何处理）');
+      } else if (target.kind === 'issue') {
+        core.info(`人工重跑：开始治理 Issue #${target.number}`);
+        const dispatchContext = { eventName: 'issues', repo: context.repo, payload: { issue: target.target } };
+        await handleNewIssue(governanceOctokit || octokit, openai, dispatchContext, owner, repo, aiModel, config, labelsList, blacklistUsers, gov);
+      } else if (!enablePrGovernance) {
+        core.info('PR 治理默认关闭（enable-pr-governance=false），跳过');
+      } else {
+        core.info(`人工重跑：开始治理 PR #${target.number}`);
+        const dispatchContext = { eventName: 'pull_request_target', repo: context.repo, payload: { pull_request: target.target } };
+        await handleNewPR(governanceOctokit || octokit, openai, dispatchContext, owner, repo, aiModel, config, labelsList, blacklistUsers, gov);
+      }
+    } else if (context.eventName === 'issues' && context.payload.action === 'opened') {
       await handleNewIssue(governanceOctokit || octokit, openai, context, owner, repo, aiModel, config, labelsList, blacklistUsers, gov);
     } else if ((context.eventName === 'pull_request_target') && context.payload.action === 'opened') {
       if (enablePrGovernance) {

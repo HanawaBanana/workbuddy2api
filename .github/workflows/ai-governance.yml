@@ -10,7 +10,18 @@ name: AI Governance
 on:
   issues:
     types: [opened]
-  workflow_dispatch: {}
+  # 人工重跑入口：填 issue-number 或 pr-number 后触发，对既有内容重跑同一条治理链路
+  # （AI 后端故障恢复后补跑、AI 误判后人工纠偏）。两个都留空时只告警、不做任何处理。
+  workflow_dispatch:
+    inputs:
+      issue-number:
+        description: '目标 issue 编号（与 pr-number 二选一）'
+        required: false
+        type: string
+      pr-number:
+        description: '目标 PR 编号（与 issue-number 二选一）'
+        required: false
+        type: string
   # pull_request_target 让 action（含写操作）以目标仓库而不是 fork 身份运行 ——
   # 这是 PR 治理改标题/正文/建 canonical 所必需的写权限来源（详见 DESIGN.md §12）。
   pull_request_target:
@@ -67,6 +78,9 @@ jobs:
         uses: ./.github/actions/ai-governance
         with:
           github-token: ${{ github.token }}
+          # 人工重跑目标（仅 workflow_dispatch 使用；其他事件下为空字符串）
+          issue-number: ${{ inputs.issue-number }}
+          pr-number: ${{ inputs.pr-number }}
           # 治理身份令牌：claude-identity 步骤用 runner OIDC 从 Anthropic 换来的
           # Claude GitHub App installation token —— 治理的评论/关闭/建 issue/打标签
           # 全部以 claude[bot] 署名。换票失败时回落 github-actions[bot]（action 内部

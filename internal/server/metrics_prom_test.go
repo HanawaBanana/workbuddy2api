@@ -253,7 +253,7 @@ func TestPromMetricsLabelEscaping(t *testing.T) {
 		Since:  time.Now(),
 		Models: []ModelStatPayload{{Model: weird, Requests: 1, Success: 1}},
 	}
-	out := writePromMetrics(snap, nil, 0, 0, false)
+	out := writePromMetrics(snap, nil, 0, 0, false, nil)
 
 	for i, ln := range strings.Split(strings.TrimSuffix(out, "\n"), "\n") {
 		if strings.HasPrefix(ln, "#") {

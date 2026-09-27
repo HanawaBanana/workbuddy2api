@@ -7,11 +7,13 @@
 package scheduler
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // repoRoot 定位仓库根（容器内 /app、宿主 /root/workbuddy2api）。
@@ -76,34 +78,58 @@ func pythonCmd() string {
 
 // runScript 依次执行若干脚本命令：任一命令失败只记一行 WARN，不向上抛、
 // 不影响调度主循环继续跑下一个时点。单命令失败不中断后续命令。
-func runScript(name, root string, commands [][]string) {
+//
+// 返回成功/失败命令数与最后一条失败摘要，供台账计数（note 取最后一条：多命令
+// 全挂时最有价值的是「最近一次为什么挂」，逐条细节已在日志里）。
+func runScript(name, root string, commands [][]string) (ok, fail int, note string) {
 	for _, cmdArgs := range commands {
 		c := newScriptCmd(cmdArgs[0], cmdArgs[1:]...)
 		c.SetDir(root)
 		if err := c.Run(); err != nil {
+			fail++
+			note = fmt.Sprintf("%s: %v", cmdArgs[1], err)
 			log.Printf("WARN: %s (%s): %v", name, cmdArgs[1], err)
 			continue
 		}
+		ok++
 		log.Printf("%s: ok (%s)", name, cmdArgs[1])
 	}
+	return ok, fail, note
 }
 
-// RunSchoolNow 立即执行开学季任务：school_open_day_2026.py ALL --run --yes。
+// runScriptTask 跑一组脚本命令并记台账：脚本类任务（school/cat）只有「命令级」
+// 粒度——一条命令要么成功要么失败，没有账号维度的分解。
+//
+// 退出码非 0 即算 Fail（脚本自己会把「活动下线」「非窗口期」等正常态处理成 0 退出，
+// 见 RunSchoolNow/RunCatNow 的注释），所以这里的 Fail 就是真的失败了。
+func (s *Scheduler) runScriptTask(kind taskKind, trigger, name string, commands [][]string) {
+	started := time.Now()
+	okN, failN, note := runScript(name, repoRoot(), commands)
+	s.recordRun(kind, trigger, started, runTally{
+		total: okN + failN, ok: okN, fail: failN, note: note,
+	})
+}
+
+// RunSchoolNow 立即执行开学季任务（人工入口）。
+func (s *Scheduler) RunSchoolNow() { s.runSchool(triggerManual) }
+
+// runSchool 执行开学季任务：school_open_day_2026.py ALL --run --yes。
 // 全量跑任务点亮 + 领奖 + 自动抽空抽奖余额。活动下线（in_period=false）时脚本
 // 各段全量跳过、正常退出，不视为失败。失败只记 WARN。
-func (s *Scheduler) RunSchoolNow() {
-	root := repoRoot()
-	runScript("school", root, [][]string{
+func (s *Scheduler) runSchool(trigger string) {
+	s.runScriptTask(taskSchool, trigger, "school", [][]string{
 		{pythonCmd(), "scripts/school_open_day_2026.py", "ALL", "--run", "--yes"},
 	})
 }
 
-// RunCatNow 立即执行夜猫子任务：task_runner.py ALL --yes --only black_cat。
+// RunCatNow 立即执行夜猫子任务（人工入口）。
+func (s *Scheduler) RunCatNow() { s.runCat(triggerManual) }
+
+// runCat 执行夜猫子任务：task_runner.py ALL --yes --only black_cat。
 // black_cat 时段敏感：夜猫窗口 23:00–08:00 CST 内最多补 1 次（task_runner 内部
 // 判定，非窗口期打印 skip 正常退出）。失败只记 WARN。
-func (s *Scheduler) RunCatNow() {
-	root := repoRoot()
-	runScript("cat", root, [][]string{
+func (s *Scheduler) runCat(trigger string) {
+	s.runScriptTask(taskCat, trigger, "cat", [][]string{
 		{pythonCmd(), "scripts/task_runner.py", "ALL", "--yes", "--only", "black_cat"},
 	})
 }

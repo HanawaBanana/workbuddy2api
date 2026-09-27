@@ -228,4 +228,70 @@ describe('callAI', () => {
       responsesConfig
     )).rejects.toMatchObject({ code: 'server_error', message: 'Provider failed' });
   });
+  test('surfaces non-JSON 200 responses from the chat endpoint instead of a TypeError', async () => {
+    // 回归锚点（2026-09）：端点把响应替换成 `OK` 文本时，openai SDK 4.x 会把响应体当
+    // 字符串返回；旧实现 `response.choices[0]` 抛 TypeError，把真实原因掩盖成
+    // 「Claude Code 服务不可用」的 fail-open 评论（本仓库 AI 治理曾因此静默失效数周）。
+    const openai = {
+      chat: { completions: { create: jest.fn().mockResolvedValue('OK\r\n') } }
+    };
+
+    const error = await callAI(
+      openai,
+      'model',
+      { instructions: 'Classify spam.', input: 'prompt' },
+      config
+    ).catch(caught => caught);
+
+    expect(error).toMatchObject({ code: 'non_json_ai_response' });
+    expect(error.message).toContain('OK');
+    expect(error.message).not.toContain('reading');
+    expect(isContentFilterError(error)).toBe(false);
+  });
+
+  test('reports chat responses without a choices array', async () => {
+    const openai = {
+      chat: { completions: { create: jest.fn().mockResolvedValue({ error: { message: 'quota' } }) } }
+    };
+
+    const error = await callAI(
+      openai,
+      'model',
+      { instructions: 'Classify spam.', input: 'prompt' },
+      config
+    ).catch(caught => caught);
+
+    expect(error).toMatchObject({ code: 'malformed_ai_response' });
+    expect(error.message).toContain('choices');
+  });
+
+  test('keeps the empty-content fallback for well-formed chat responses', async () => {
+    const openai = {
+      chat: { completions: { create: jest.fn().mockResolvedValue({ choices: [{ message: { content: '   ' } }] }) } }
+    };
+
+    await expect(callAI(
+      openai,
+      'model',
+      { instructions: 'Classify spam.', input: 'prompt' },
+      config
+    )).rejects.toThrow('AI response did not contain text output');
+  });
+
+  test('surfaces non-JSON Responses API responses instead of a TypeError', async () => {
+    const responsesConfig = {
+      ...config,
+      ai_settings: { ...config.ai_settings, api_type: 'responses' }
+    };
+    const openai = { responses: { create: jest.fn().mockResolvedValue('OK') } };
+
+    const error = await callAI(
+      openai,
+      'model',
+      { instructions: 'Validate input.', input: 'prompt' },
+      responsesConfig
+    ).catch(caught => caught);
+
+    expect(error).toMatchObject({ code: 'non_json_ai_response' });
+  });
 });

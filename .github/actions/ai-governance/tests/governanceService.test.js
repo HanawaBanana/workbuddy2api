@@ -209,6 +209,64 @@ describe('IssueGovernanceService', () => {
     expect(commentCall[4]).toContain('✅ Claude Code 操作日志：');
   });
 
+  test('评审评论草稿的 max_tokens 局部放宽到 2000（推理模型的思考 token 会吃正文预算）', async () => {
+    const config = buildConfig();
+    expect(config.ai_settings.max_tokens).toBe(1000);
+    // 依次: extract(structured) -> well_formed 判定 -> 评审评论生成
+    const openai = makeOpenai([
+      '```json\n{"要点":"a","要做的事":[]}\n```',
+      'WELL_FORMED',
+      '感谢提交……'
+    ]);
+    const gov = new IssueGovernanceService(openai, 'model', config, { dryRun: false }, makeOps({ canonicalItems: [] }));
+
+    await gov.govern({}, 'o', 'r', issue, 'enhancement');
+
+    // 回归锚点（2026-09 实测）：cap=1000 时推理模型 finish_reason=length（thinking 吃掉
+    // 355~781 tokens），评论被截断成半句话，三段结构只剩第一段；只有评论草稿那次放宽。
+    const caps = openai._create.mock.calls.map(call => call[0].max_tokens);
+    expect(caps).toEqual([1000, 1000, 2000]);
+    // 放宽只作用于本次调用的副本，不就地改写全局配置
+    expect(config.ai_settings.max_tokens).toBe(1000);
+  });
+
+  test('canonical 草稿的 max_tokens 同样放宽到 2000（思考 token 吃满 1000 会返回空正文）', async () => {
+    const config = buildConfig();
+    const draft = [
+      '[Feature] 支持按账号跳过签到',
+      '',
+      '## 概述',
+      '支持把指定账号从签到任务里摘出来。',
+      '',
+      '## 背景与要点',
+      '- 多账号场景下需要临时排除某个账号',
+      '',
+      '## 期望行为',
+      '- 新增 checkin.skip_uids 配置项',
+      '',
+      '## 来源',
+      '- 原始 issue: #22'
+    ].join('\n');
+    // 依次: extract(structured) -> well_formed 判定(NEEDS_NORMALIZE) -> canonical 草稿
+    const openai = makeOpenai([
+      '```json\n{"要点":"跳过签到","要做的事":["新增配置项"]}\n```',
+      'NEEDS_NORMALIZE',
+      draft
+    ]);
+    const gov = new IssueGovernanceService(openai, 'model', config, { dryRun: false }, makeOps({ canonicalItems: [] }));
+
+    const result = await gov.govern({}, 'o', 'r', issue, 'enhancement');
+
+    expect(result).toMatchObject({
+      decision: GOVERNANCE_DECISIONS.NEW_TOPIC,
+      canonicalNumber: 99,
+      closed: true
+    });
+    const caps = openai._create.mock.calls.map(call => call[0].max_tokens);
+    expect(caps).toEqual([1000, 1000, 2000]);
+    expect(config.ai_settings.max_tokens).toBe(1000);
+  });
+
   test('WELL_FORMED 但 AI 评审生成失败：回落固定模板评论，流程不中断', async () => {
     const config = buildConfig();
     // 依次: extract -> well_formed 判定 -> 评审生成抛错

@@ -109,7 +109,7 @@ func TestRunActivityCtxCancelsDuringAccountDelay(t *testing.T) {
 	defer cancel()
 	done := make(chan struct{})
 	go func() {
-		s.runActivity(ctx)
+		s.runActivity(ctx, triggerSchedule)
 		close(done)
 	}()
 
@@ -153,7 +153,7 @@ func TestRunTravelCtxCancelsDuringAccountDelay(t *testing.T) {
 	defer cancel()
 	done := make(chan struct{})
 	go func() {
-		s.runTravel(ctx)
+		s.runTravel(ctx, triggerSchedule)
 		close(done)
 	}()
 
