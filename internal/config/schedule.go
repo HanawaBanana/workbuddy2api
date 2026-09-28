@@ -105,7 +105,7 @@ func DefaultSchedule() Schedule {
 		SchoolEnabled:       true,
 		CatEnabled:          true,
 		ActivityReportCount: 5, // 领猫前置需 5 次对话，5 连发刷满 chat_5
-		RetryMaxPerDay:      1, // 只写了 retry_delay_minutes 时的保守默认：每天补跑一次
+		RetryMaxPerDay:      2, // 只写了 retry_delay_minutes 时的默认：每天最多补跑两次
 	}
 }
 
