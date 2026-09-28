@@ -23,6 +23,9 @@ func checkinActivityScheduler(t *testing.T, h http.HandlerFunc) (*Scheduler, *po
 
 // TestWarnCheckinActivityQueriesOnce 活动状态是活动级数据：一轮只打一次上游，
 // 不随账号数放大（否则一个只读探测会把请求量变成 O(N)）。
+//
+// 同时固化契约：必须 POST。本功能曾因误用 GET 导致同路径 404、整个预警静默失效，
+// 这个断言就是那道防线。
 func TestWarnCheckinActivityQueriesOnce(t *testing.T) {
 	var calls atomic.Int32
 	s, p, srv := checkinActivityScheduler(t, func(w http.ResponseWriter, r *http.Request) {
@@ -30,13 +33,13 @@ func TestWarnCheckinActivityQueriesOnce(t *testing.T) {
 			http.Error(w, "not found", 404)
 			return
 		}
-		if r.Method != http.MethodGet {
-			http.Error(w, "want GET", 405)
+		if r.Method != http.MethodPost {
+			http.Error(w, "want POST", 405)
 			return
 		}
 		calls.Add(1)
-		w.Write([]byte(`{"code":0,"msg":"ok","data":{"enabled":true,` +
-			`"end_at":"2030-01-01T00:00:00+08:00","credits":100}}`))
+		w.Write([]byte(`{"code":0,"msg":"ok","data":{"active":true,` +
+			`"end_time":"2030-01-01 23:59:59","daily_credit":100}}`))
 	})
 	defer srv.Close()
 
