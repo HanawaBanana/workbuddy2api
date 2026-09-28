@@ -136,14 +136,20 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容上游网关**，将 ```CodeB
 分类打标、要点提炼、canonical 归并；PR 侧另有关联记录与历史语境评审。AI 后端用仓库 Secrets
 `AI_BASE_URL` / `AI_API_KEY` / `AI_MODEL` 指向任意 OpenAI 兼容端点。
 
-- **人工重跑**：Actions → AI Governance → Run workflow，填 `issue-number` 或 `pr-number`（二选一）
-  即可对既有内容重跑同一条治理链路；两者都留空时只告警、不做任何处理。
-- **维护者豁免**：`maintainer-exempt`（默认开）让协作者提交的内容跳过归并 / 重开，只保留垃圾检测与分类打标。
-- **先行演练**：`dry-run` 只评论不写入，用于上线前观察判定质量。
+> **提 PR 前请看 [贡献与 PR 要求](#贡献与-pr-要求)**：本仓库的 PR 会被 AI 自动打标、规范化标题、
+> 关联 canonical，**通过闸门后会直接自动合并**；不满足要求的会被判 `TRIVIAL` / 垃圾并自动关闭。
+
+- **自动审核**：PR 创建时自动跑垃圾检测、标题规范（Conventional Commits）、质量判定、分类打标、
+  历史语境评审，并在正文顶部追加自动维护的关联块（`<!-- ai-governance:linked -->` 锚点，请勿删除）。
 - **自动合并**（`enable-auto-approve`）：通过闸门的 PR（分层检测 KEEP + 改动不含 CI / 构建 / 依赖 /
   脚本类文件 + 规模在上限内）会被打上 `ai-approved` 标签，由 `PR Auto-merge` 工作流启用仓库原生
   auto-merge —— **必须在 PR CI（`test` 检查）通过后才合并**；PR 有新提交会自动撤销批准，需重新评审。
   维护者叫停：摘掉 `ai-approved` 标签并关闭 auto-merge 即可。
+- **人工重跑**：Actions → AI Governance → Run workflow，填 `issue-number` 或 `pr-number`（二选一）
+  即可对既有内容重跑同一条治理链路；两者都留空时只告警、不做任何处理。
+- **维护者豁免**：`maintainer-exempt`（默认开）让协作者提交的内容跳过归并 / 重开与自动合并，
+  只保留垃圾检测与分类打标。
+- **先行演练**：`dry-run` 只评论不写入，用于上线前观察判定质量。
 
 ## 架构总览
 
@@ -300,6 +306,59 @@ curl -s http://localhost:7863/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"stream":false}'
 ```
+
+## 贡献与 PR 要求
+
+**本仓库的 PR 由 AI 自动审核，并在通过闸门后自动合并。** 提交前请按下面的自查清单过一遍 ——
+这些要求不是礼节，而是流水线的实际输入：不满足大概率会被判 `TRIVIAL` / 垃圾而自动关闭，
+或拿不到自动合并资格（只能等人工）。
+
+### 会自动化发生的事（先知道这些）
+
+| 环节 | 行为 |
+| --- | --- |
+| 触发 | **只在 PR 创建时**自动评审一次；之后改标题、追加提交都不会自动重跑 |
+| 打标 | 自动打一个分类标签（`bug` / `enhancement` / `question` / `documentation`） |
+| 改标题 | 标题不符合 Conventional Commits 时**会被 AI 改写**（如 `feat(scheduler): …`） |
+| 改正文 | 在正文顶部追加自动维护的块（要点 + 关联的 canonical issue，带 `<!-- ai-governance:linked -->` 锚点）；**请勿删除锚点行**，也不要手工重复它 |
+| 关闭 | 垃圾 / 恶意内容 → 关闭并**锁定**；只有测试、无意义或纯占位的改动 → 判 `TRIVIAL` 关闭（不锁定）；与历史结论冲突（重复已合并、或维护者已 wontfix 的改动）→ 附历史依据关闭并打 `history-rejected` |
+| 合并 | 通过闸门的 PR 由**仓库原生 auto-merge** squash 合并进 `master`；提交信息取 PR 标题，所以标题要写成一句人话 |
+| 身份 | 以上动作由 `github-actions[bot]` 执行。不同意判定就在 PR 下留言并 @ 维护者 —— 维护者可摘掉标签、关闭 auto-merge、或重跑治理 |
+
+### 自动合并的闸门
+
+只有**全部满足**才会被自动合并；缺任何一条都只走人工：
+
+1. **分层检测 `KEEP`**：非垃圾 + 标题符合 Conventional Commits + 质量 `VALID`；
+2. **不含敏感路径**（这类改动永远人工合并，绝不自动合）：
+   - `.github/**`（CI / 工作流 / Action）—— 自动合并这类改动等于把仓库执行权限交给贡献者；
+   - `Dockerfile`、`docker-compose*.yml`、`Makefile`；
+   - `go.mod`、`go.sum`（依赖与构建图）；
+   - `scripts/**`、任意 `*.sh` / `*.cmd` / `*.ps1`；
+3. **规模在上限内**：≤ 20 个文件且 ≤ 800 行改动（超过就只做人工评审）；
+4. **CI 绿**：`PR CI` 的 `test` 检查通过 —— 它已设为 `master` 的必需检查，auto-merge 会等它；
+5. **不是草稿**，且作者不是维护者 / 协作者（协作者的 PR 只做检测与打标，不走自动合并）。
+
+拿到 `ai-approved` 并启用 auto-merge 之后，**再推一次提交就会撤销批准**（重新评审：
+Actions → AI Governance → Run workflow，填 `pr-number`）—— 所以尽量一次改完再提。
+
+> 首次向本仓库贡献时，GitHub 默认需要维护者批准后才会跑 CI；在那之前 auto-merge 会一直等。
+
+### 提交 PR 的清单
+
+- [ ] **标题用 Conventional Commits**：`type(scope): 描述`，`type` ∈ `feat` `fix` `docs` `chore` `refactor` `test` `perf` `ci` `build`；
+- [ ] **一个 PR 只做一件事**：多主题请拆开 —— AI 按单主题判定与归并，混合改动容易被归并或判 `TRIVIAL`；
+- [ ] **正文写清「问题 / 目标 + 方案」**：AI 从正文提炼要点并挂到 canonical issue，只贴 diff 会被判 `UNCLEAR`；
+- [ ] **带测试**：改动配套 `_test.go`（本仓库惯例），并保证本地 `go build ./...` 与 `go test ./...` 通过；
+- [ ] **不夹带无关改动**（整仓格式化、顺手重构、改无关文件）：会稀释评审，并可能被判 `TRIVIAL`；
+- [ ] **不提交敏感信息**（密钥 / token / `auths/` / 真实凭证）：PR 标题、正文与 diff 会被发送到仓库配置的 AI 端点用于判定；
+- [ ] **一次改完再提**：新提交会撤销自动合并批准，反复推只会增加人工介入。
+
+### 顺带两条仓库约定
+
+- **文档写进 `README.md`**：`.gitignore` 忽略 `*.md` 与 `docs/`，只有 `README.md` 进版本库 —— 新增 `docs/xxx.md` 会被静默忽略；
+- **issue 同样自动处理**：垃圾会关闭并锁定；README / 置顶 issue 已回答的会被回答后关闭（不锁定）；
+  写得规范的会被提炼要点、打成 `canonical` 并给出评审意见；重复的会合并到已有 canonical 后关闭。
 
 ## 安全与合规
 
