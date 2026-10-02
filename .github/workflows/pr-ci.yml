@@ -5,13 +5,30 @@
 # 自动合并不能建在没有测试门禁的地基上 —— 否则 AI 的判定就是唯一闸门。
 #
 # master 的分支保护把本工作流的 test 检查列为必需，原生 auto-merge 才会等它通过再合并。
+#
+# 【迁移进行中：本步骤让 pull_request_target 先落地】
+# 目标：test 检查必须**总能上报**。此前只有 pull_request 触发，而来自 fork 的运行会被
+# GitHub 挂起等维护者点「Approve workflows to run」（仓库 approval_policy =
+# first_time_contributors）：批准之前 test 永远不出结果，PR 永远 BLOCKED —— 即使 AI 已经
+# 打了 ai-approved、auto-merge 也已经启用，也只能无限等待（#19 就是这样卡住的，
+# 补上批准后立刻自动合并；#21 同样是 fork 提交，卡的是同一处）。
+#
+# 分成两个 PR 落地，是因为「哪个触发方式产出 test」本身无法自证：本 PR 里
+# pull_request_target 只存在于 merge-ref 的这份文件里，而该事件只认默认分支上的定义，
+# 所以本 PR 的 test 仍然由 pull_request 这一路提供；下一份 PR 再摘掉 pull_request 触发。
 name: PR CI
 
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+  # 新增：不受「fork 首次贡献需批准」约束的那一路（下一份 PR 里会移除上面那路）。
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
+  # pull_request_target 下 GITHUB_TOKEN 默认是读写；必须显式钉死只读，
+  # 因为下面会检出并执行不可信代码（这是该事件的标准加固方式）。
+  # 本工作流不引用任何 secret，所以不可信代码拿不到任何凭据。
   contents: read
 
 concurrency:
@@ -27,12 +44,19 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          # 语义与 pull_request 的默认检出保持一致：测的是「合并后的结果」。
+          # merge_commit_sha 即 pull_request 事件下的 github.sha；为空时（无法计算合并，
+          # 例如有冲突）退化到 PR 头部提交，此时 PR 本来也合不了。
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.event.pull_request.head.sha }}
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-          cache: true
+          # 关掉缓存：pull_request_target 下缓存是可写的，而本工作流会执行不可信代码；
+          # 避免 PR 运行往 Go 缓存（以及 build.yml 复用的 GHA docker 缓存）里写东西。
+          cache: false
 
       # 不加 gofmt 门禁：仓库现有文件并未整体 gofmt 干净，加进来会立刻全红
       - name: Build
