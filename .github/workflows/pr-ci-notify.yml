@@ -59,10 +59,16 @@ jobs:
           HEAD_OWNER=$(jq -r '.head_repository.owner.login // ""' /tmp/run.json)
           RUN_URL=$(jq -r '.html_url // ""' /tmp/run.json)
           echo "run=$RUN branch=$BRANCH head_owner=$HEAD_OWNER"
-          # workflow_run 负载里 pull_requests 对 pull_request_target 运行为空，
-          # 所以按 head 分支（fork 用 owner:branch 写法）反查 PR。
-          PR=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --head "$HEAD_OWNER:$BRANCH" \
-            --json number --jq '.[0].number // empty')
+          # workflow_run 负载里 pull_requests 对 pull_request_target 运行为空，所以按
+          # head 仓库 + head 分支反查 PR。
+          # 不能用 `gh pr list --head "<owner>:<branch>"` —— gh 明确不支持该语法
+          # ("--head flag: `<owner>:<branch>` syntax not supported"，实测查不到同仓库分支的 PR)，
+          # 因此拉取开放 PR 后用 jq 精确匹配 head 仓库 owner 与分支，同仓库/fork 两种情况统一处理。
+          gh pr list --repo "$GITHUB_REPOSITORY" --state open --limit 200 \
+            --json number,headRefName,headRepositoryOwner > /tmp/open-prs.json
+          PR=$(jq -r --arg b "$BRANCH" --arg o "$HEAD_OWNER" \
+            '.[] | select(.headRefName == $b and .headRepositoryOwner.login == $o) | .number' \
+            /tmp/open-prs.json | head -1)
           if [ -z "$PR" ]; then
             echo "::warning::运行 $RUN（$HEAD_OWNER:$BRANCH）没有对应的开放 PR，跳过"
             exit 0
