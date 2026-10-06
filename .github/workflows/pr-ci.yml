@@ -15,6 +15,17 @@
 # pull_request_target 不受该约束，而且工作流定义固定取默认分支上的这一份 —— PR 改不动 CI
 # 要跑什么，这一点比 pull_request 更不容易被贡献者改写。
 #
+# 【知情后选择加入：允许检出 fork 的代码】
+# 该事件跑在「受信上下文」（基仓库的 token / 默认分支缓存域）里，所以 actions/checkout 默认
+# 拒绝检出 fork 的代码，报 "Refusing to check out fork pull request code" —— #26 就是这样
+# 直接红的（fork PR 的 test 全部失败，等于门禁失效）。这里显式放行，换取必需检查总能上报。
+# 放行的前提是本工作流已经把可被利用的东西全部砍掉：
+#   - 不引用任何 secret；
+#   - GITHUB_TOKEN 钉死 contents: read；
+#   - 关闭缓存（不可信代码写不进仓库缓存）；
+#   - persist-credentials: false（不可信代码在 .git/config 里也拿不到 token）。
+# 也就是：被执行的不可信代码除了 runner 的 CPU 与网络，拿不到任何凭据。
+#
 # 维护提示：分支保护里的必需检查必须由不受该批准策略约束的事件产出（就是本文件现在这样）。
 # 新增必需检查或改回 pull_request 触发，都会重新引入「批准前拿不到检查结果、auto-merge 无限
 # 等待」的死锁 —— 而换触发方式本身无法自证（该事件只认默认分支上的定义），需要分两步灰度。
@@ -27,7 +38,6 @@ on:
 permissions:
   # pull_request_target 下 GITHUB_TOKEN 默认是读写；必须显式钉死只读，
   # 因为下面会检出并执行不可信代码（这是该事件的标准加固方式）。
-  # 本工作流不引用任何 secret，所以不可信代码拿不到任何凭据。
   contents: read
 
 concurrency:
@@ -48,6 +58,10 @@ jobs:
           # merge_commit_sha 为空时（无法计算合并，例如有冲突）退化到 PR 头部提交，
           # 此时 PR 本来也合不了。
           ref: ${{ github.event.pull_request.merge_commit_sha || github.event.pull_request.head.sha }}
+          # 见文件头「知情后选择加入」：不放行则 fork PR 的 test 必红，门禁等于失效。
+          allow-unsafe-pr-checkout: true
+          # 不把 token 写进 .git/config，让后面跑的不可信代码无从取用。
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@v5
