@@ -70,6 +70,19 @@ type Config struct {
 	// 关闭时 /admin/* 一律 404（而非 403——不向外暴露"这里存在管理面"）。
 	AdminEnabled bool
 
+	// CheckinHistory 签到历史存储（checkin_history.go）：每次全量签到的逐账号结果
+	// 由 cmd/server 在 scheduler 回调里落盘，这里只读回放给 GET /v1/checkin/history。
+	// nil = 未接线（测试形态），端点仍可用但 records 恒为空。
+	CheckinHistory *CheckinHistoryStore
+
+	// CheckinSchedule 只读排程快照 + 下一个自动签到时点（由 *scheduler.Scheduler 实现）。
+	//
+	// 走接口而非直接 import scheduler：server 已被 scheduler 间接依赖链上的
+	// cmd/server 组装，反向 import 会成环；且「下一个时点」必须由**唯一实现方**
+	// 计算——排程带确定性 jitter 派生，前端自己复刻迟早漂移（见 checkin_history.go）。
+	// nil = 未接线，响应里 enabled=false / hours=[] / 无 next_fire_at。
+	CheckinSchedule CheckinScheduleProvider
+
 	// MetricsEnabled Prometheus 指标端点开关（config metrics.enabled，默认 false）。
 	// 关闭时 /metrics 不注册（同 AdminEnabled 的条件注册理由：不向未鉴权探测暴露
 	// "这里有个指标面"）。开启后走 withAuth，与 /status、/v1/stats 同鉴权口径。
@@ -220,6 +233,14 @@ func NewHandler(cfg Config) *Handler {
 	// 不同量级，和 /v1/stats/reset 同类；且控制台要开箱可用，不该要求先开管理面。
 	// 仍需 api_key（withAuth）+ 30s 冷却，防脚本连点放大上游压力。
 	h.mux.HandleFunc("POST /v1/checkin", h.withAuth(h.checkin))
+	// 签到历史只读回放（GET /v1/checkin/history）：控制台据此画「今天签到了吗 /
+	// 还有多久自动签」——数据源是落盘的 data/checkin.json，不触发任何上游请求。
+	//
+	// ★ 不挂 admin.enabled 闸、但要过 withOps ★
+	// 挂 admin 闸会让功能在现状（admin.enabled=false）下直接 404 不可用；而历史里
+	// 含**全部账号的昵称与 UID**，属运维信息，不能开给发给外部调用方的分组密钥。
+	// withAuth + withOps = 「主密钥可用 / 分组密钥 403」，两头都不牺牲。
+	h.mux.HandleFunc("GET /v1/checkin/history", h.withAuth(withOps(h.checkinHistory)))
 	// 运维管理端点（默认关闭，config admin.enabled 开启后生效）。
 	// 路径用 {uid} 通配而非查询参数：uid 是账号身份，放进路径便于审计与直观。
 	// 条件注册而非 handler 内 404（设计 supplement §2.3）：未注册的路由对未鉴权

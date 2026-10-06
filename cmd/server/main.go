@@ -41,14 +41,19 @@ func checkinReportFn(sch *scheduler.Scheduler, p *pool.Pool, cfg *Config) func()
 		}
 		// realm 由号池现查（CheckinOutcome 本身不带 realm，免得 scheduler 与 pool
 		// 两处各存一份口径）；查不到留空，前端按「—」显示。
-		realmOf := func(uid string) string {
-			if a := p.AuthByUID(uid); a != nil {
-				return a.Realm()
-			}
-			return ""
-		}
-		return buildCheckinReport(outcomes, realmOf,
+		return buildCheckinReport(outcomes, realmOfFn(p),
 			cfg.Schedule.CheckinEnabled, cfg.Schedule.CheckinHours), false, nil
+	}
+}
+
+// realmOfFn 返回「按 uid 现查 realm」的闭包。手动回执与签到历史落盘共用它，
+// 保证两条路径的 realm 归属永远一致。
+func realmOfFn(p *pool.Pool) func(string) string {
+	return func(uid string) string {
+		if a := p.AuthByUID(uid); a != nil {
+			return a.Realm()
+		}
+		return ""
 	}
 }
 
@@ -93,6 +98,16 @@ func modelJSONPath(stateFile string) string {
 		return ""
 	}
 	return filepath.Join(filepath.Dir(stateFile), "model.json")
+}
+
+// checkinJSONPath 由 state.json 路径推导 checkin.json 路径（同目录同名换缀）：
+// 签到历史与 state.json 同为数据目录持久化物（Docker ./data volume），配套而非各自配置。
+// 空 state 路径（纯内存测试形态）→ 空 = 禁用落盘（历史仅存内存）。
+func checkinJSONPath(stateFile string) string {
+	if stateFile == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(stateFile), "checkin.json")
 }
 
 func main() {
@@ -208,6 +223,13 @@ func main() {
 	up.BillingBaseGlobal = cfg.Global.BillingBase
 	up.GlobalEnabled = cfg.Global.Enabled
 
+	// 签到历史落盘（GET /v1/checkin/history 的数据源）。此前签到结果只活在
+	// POST /v1/checkin 的 HTTP 响应里——刷新页面即失忆，自动 9/21 那趟更是完全
+	// 看不到（日志只有一行聚合计数，成功路径不打日志）。文件缺失 = 还没有历史
+	// （不报错）；解析失败改名留证再从空开始，绝不静默覆盖。
+	checkinStore := server.NewCheckinHistoryStore(checkinJSONPath(cfg.StateFile))
+	checkinStore.Load()
+
 	sch := scheduler.New(scheduler.Config{
 		Pool:                p,
 		Upstream:            up,
@@ -234,6 +256,14 @@ func main() {
 		KeepaliveDisabled: !cfg.Schedule.KeepaliveEnabled,
 		SchoolDisabled:    !cfg.Schedule.SchoolEnabled,
 		CatDisabled:       !cfg.Schedule.CatEnabled,
+		// 签到结束即落盘：手动入口与定时排程都走 CheckinAll，挂钩一处两条路径全覆盖。
+		// 映射成 HTTP 口径复用 buildCheckinReport —— 保证「即时回执」与「历史回放」
+		// 永远是同一份数据，不会出现两套计数口径。
+		OnCheckinDone: func(outcomes []scheduler.CheckinOutcome, started, finished time.Time) {
+			checkinStore.Append(
+				buildCheckinReport(outcomes, realmOfFn(p), cfg.Schedule.CheckinEnabled, cfg.Schedule.CheckinHours),
+				started, finished)
+		},
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
@@ -340,6 +370,10 @@ func main() {
 		// 手动签到入口（POST /v1/checkin）。★ 走进程内 CheckinAll ★ 外部 CLI
 		// 签到不会更新网关内存额度（见 internal/server/checkin.go 顶部注释）。
 		CheckinFn: checkinReportFn(sch, p, cfg),
+		// 签到历史（GET /v1/checkin/history）与排程快照（下一个自动签到时点，
+		// 含 jitter 派生）。*scheduler.Scheduler 同时实现 CheckinScheduleProvider。
+		CheckinHistory:  checkinStore,
+		CheckinSchedule: sch,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

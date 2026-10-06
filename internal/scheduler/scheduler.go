@@ -71,6 +71,17 @@ type Config struct {
 	// LedgerFile 任务执行台账落盘路径。空 = 纯内存（重启后只剩新跑过的记录）。
 	// 台账是观测数据，落盘失败只记日志、不影响任务执行，故不做启动期 fail-fast。
 	LedgerFile string
+
+	// OnCheckinDone 每次全量签到**结束**后的回调（见 CheckinAll 尾部）。
+	//
+	// 为什么挂在 CheckinAll 里而不是各调用点：手动入口（cmd/server 的
+	// checkinReportFn）与定时排程（RunCheckinNow）都走这一个函数，挂钩一处
+	// 即两条路径全覆盖，不会出现「手动签的记了、自动签的没记」这类口径分裂。
+	//
+	// 签名用 []CheckinOutcome 而非 server.CheckinReport：scheduler 不反向 import
+	// server（成环），映射成 HTTP 口径由 cmd/server 的 buildCheckinReport 负责。
+	// started/finished 为本次签到起止时刻。nil = 不落盘（老调用方/测试零改动）。
+	OnCheckinDone func(outcomes []CheckinOutcome, started, finished time.Time)
 }
 
 // Scheduler 调度器。
@@ -461,6 +472,7 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 	}
 	defer s.checkinMu.Unlock()
 
+	started := time.Now()
 	statuses := s.cfg.Pool.List()
 	out := make([]CheckinOutcome, 0, len(statuses))
 	var okN, alreadyN, failN, skipN int
@@ -566,7 +578,37 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 		len(statuses), okN, alreadyN, failN, skipN)
 	// 顺带做一次签到活动到期预警（只读探测，不影响签到结果；见 checkin_activity.go）。
 	s.warnCheckinActivity(statuses)
+	// 结果回调（落盘供控制台回放）：手动入口与定时排程共用此处，两条路径口径一致。
+	// 在锁内执行：落盘期间并发 CheckinAll 拿 ErrBusy，而不是插进「历史写一半」的窗口。
+	// 回调本身不返回错误——落盘失败由实现方记日志，不能因为它让一次成功的签到被
+	// 调用方判成失败（签到是真的打了上游，结果不该被本地 IO 问题抹掉）。
+	if s.cfg.OnCheckinDone != nil {
+		s.cfg.OnCheckinDone(out, started, time.Now())
+	}
 	return out, nil
+}
+
+// CheckinSchedule 返回签到排程的只读快照（enabled / hours / jitter），
+// 供 server 的 GET /v1/checkin/history 透出。实现 server.CheckinScheduleProvider。
+//
+// hours 返回副本：调用方（HTTP handler）不该改到调度器的配置。
+func (s *Scheduler) CheckinSchedule() (enabled bool, hours []int, jitterMinutes int) {
+	hours = append([]int(nil), s.cfg.CheckinHours...)
+	return !s.cfg.CheckinDisabled, hours, s.cfg.JitterMinutes
+}
+
+// NextCheckinAt 返回 now 之后最近的一个自动签到时点；签到排程已禁用时返回零值。
+//
+// 复用 nextFire / jitterOffset 的**同一份**算法：前端只做
+// 「倒计时 = next_fire_at - now」这一件事，不自己复刻 jitter 派生——一旦有人开了
+// jitter_minutes，复刻版会静默算错（且没人会发现，因为差异只有几分钟）。
+func (s *Scheduler) NextCheckinAt(now time.Time) time.Time {
+	if s.cfg.CheckinDisabled {
+		return time.Time{}
+	}
+	// salt 与调度器内部排程点用同一个（s.cfg.JitterSalt），否则「前端倒计时」与
+	// 「实际触发时刻」会算出不同偏移。
+	return nextFire(now, s.cfg.CheckinHours, taskCheckin, s.cfg.JitterMinutes, s.cfg.JitterSalt)
 }
 
 // joinDetail 拼接多段原因，避免后一段覆盖前一段的失败信息。
