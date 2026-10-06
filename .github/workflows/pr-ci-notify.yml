@@ -1,0 +1,111 @@
+# PR CI 失败时通知 PR 作者（在 PR 上评论并 @ 提及）。
+#
+# 为什么用「评论 + @ 提及」而不是直接发邮件：
+#   1) GitHub Actions 没有内置发信能力，要真发信必须自备 SMTP / 邮件服务凭据；
+#   2) 更根本的是**拿不到收件地址**：GitHub 不通过 API 暴露用户邮箱，贡献者资料里 email 常为
+#      null（#26 的作者就是），提交元数据里带的又多是
+#      <id>+<user>@users.noreply.github.com —— noreply 地址投递不达。
+#   在 PR 上评论并 @ 作者，GitHub 会把通知邮件发到对方账号注册的通知邮箱 —— 这是唯一真正能
+#   送达对方的通道，同时把失败原因留在 PR 上供所有人查阅。
+#
+# 为什么单独一个工作流、用 workflow_run 触发：
+#   PR CI 会在 pull_request_target 下检出并执行不可信代码，所以那一侧只有 contents: read。
+#   本工作流需要 pull-requests: write，因此独立出来：它不检出任何不可信代码、跑在默认分支的
+#   定义上，让写权限与不可信代码永不共存（与 pr-automerge.yml 同一思路）。
+name: PR CI Notify
+
+on:
+  workflow_run:
+    workflows: ["PR CI"]
+    types: [completed]
+  # 人工补发 / 验证：可指定某次 PR CI 运行 id；留空则取最近一次失败的运行
+  workflow_dispatch:
+    inputs:
+      run-id:
+        description: '目标 PR CI 运行 id（留空则取最近一次失败的 PR CI 运行）'
+        required: false
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: write
+
+jobs:
+  notify:
+    # 只在失败时打扰贡献者；成功 / 取消不通知
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 定位失败运行与对应 PR
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_RUN: ${{ inputs.run-id }}
+          WR_RUN: ${{ github.event.workflow_run.id }}
+        run: |
+          set -uo pipefail
+          RUN="${INPUT_RUN:-${WR_RUN}}"
+          if [ -z "${RUN:-}" ]; then
+            RUN=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow=pr-ci.yml \
+              --status failure --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+          fi
+          if [ -z "${RUN:-}" ]; then
+            echo "::warning::没有找到失败的 PR CI 运行，跳过"
+            exit 0
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN" > /tmp/run.json
+          BRANCH=$(jq -r '.head_branch // ""' /tmp/run.json)
+          HEAD_OWNER=$(jq -r '.head_repository.owner.login // ""' /tmp/run.json)
+          RUN_URL=$(jq -r '.html_url // ""' /tmp/run.json)
+          echo "run=$RUN branch=$BRANCH head_owner=$HEAD_OWNER"
+          # workflow_run 负载里 pull_requests 对 pull_request_target 运行为空，
+          # 所以按 head 分支（fork 用 owner:branch 写法）反查 PR。
+          PR=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --head "$HEAD_OWNER:$BRANCH" \
+            --json number --jq '.[0].number // empty')
+          if [ -z "$PR" ]; then
+            echo "::warning::运行 $RUN（$HEAD_OWNER:$BRANCH）没有对应的开放 PR，跳过"
+            exit 0
+          fi
+          AUTHOR=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json author --jq '.author.login')
+          echo "pr=$PR author=$AUTHOR"
+          {
+            echo "pr=$PR"
+            echo "author=$AUTHOR"
+            echo "run=$RUN"
+            echo "run_url=$RUN_URL"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 评论并 @ 作者（幂等：同一次运行只发一次）
+        if: steps.resolve.outputs.pr != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ steps.resolve.outputs.pr }}
+          AUTHOR: ${{ steps.resolve.outputs.author }}
+          RUN: ${{ steps.resolve.outputs.run }}
+          RUN_URL: ${{ steps.resolve.outputs.run_url }}
+        run: |
+          set -uo pipefail
+          MARKER="<!-- pr-ci-notify:$RUN -->"
+          gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json comments > /tmp/comments.json
+          SEEN=$(jq --arg m "$MARKER" '[.comments[].body | select(contains($m))] | length' /tmp/comments.json)
+          if [ "${SEEN:-0}" != "0" ]; then
+            echo "PR #$PR 已针对运行 $RUN 发过通知，跳过"
+            exit 0
+          fi
+          cat > /tmp/body.md <<EOF
+          $MARKER
+          @$AUTHOR 你好，\`PR CI\` 的 \`test\` 是合并的**必需检查**，它没有通过 —— 这条 PR 现在合不了，
+          auto-merge（若已启用）会一直等它。
+
+          - 运行与失败日志：$RUN_URL
+
+          请按日志修复后 push 新提交。注意两点：
+
+          1. push 新提交会自动撤销 \`ai-approved\` 批准并关闭 auto-merge，需要维护者重跑治理
+             （Actions → AI Governance → Run workflow，填 \`pr-number\`）—— 建议一次改完再推；
+          2. 若失败信息是 \`Refusing to check out fork pull request code\` 之类的**基础设施**报错
+             而非你的代码问题，直接在此留言，维护者会处理。
+          EOF
+          gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body-file /tmp/body.md
+          echo "已通知 PR #$PR 作者 @$AUTHOR"

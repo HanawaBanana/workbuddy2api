@@ -346,10 +346,23 @@ Actions → AI Governance → Run workflow，填 `pr-number`）—— 所以尽�
 > 维护者批准就能上报 `test`。此前 fork 首次贡献会被 GitHub 挂起等人工点「Approve workflows to run」，
 > 那段时间 `test` 永不出结果 —— 即使 `ai-approved` 已打、auto-merge 已启用也只能无限等待，现已不存在。
 > 代价是 fork 的代码会自动在 runner 上执行：只有只读 `GITHUB_TOKEN`、不引用任何 secret，且 PR 改不动 CI 定义本身。
+> 该事件默认还**禁止检出 fork 的代码**（`actions/checkout` 会直接报 `Refusing to check out fork pull request code`），
+> 工作流里显式放行（`allow-unsafe-pr-checkout: true`）—— 放行的前提正是上面那组加固。
 >
 > 维护提示：分支保护里的必需检查必须由**不受 fork 批准策略约束**的事件产出（目前是 `pull_request_target`）。
 > 若将来新增必需检查（或把它改回 `pull_request` 触发），fork PR 会重新出现在批准前拿不到检查结果、
 > auto-merge 无限等待的死锁。
+
+### CI 失败时怎么通知贡献者
+
+`PR CI` 的 `test` 未通过时，`PR CI Notify` 工作流会在 PR 上评论并 @ 作者：给出运行与失败日志链接，
+说明这是**必需检查**（不过就合不了，auto-merge 会一直等），并提醒「push 新提交会撤销 `ai-approved`、
+需要维护者重跑治理」。同一次运行只评论一次（正文里带幂等标记）。
+
+**为什么不直接发邮件**：Actions 没有内置发信能力（要真发信得自备 SMTP / 邮件服务凭据），而更根本的是
+**拿不到收件地址** —— GitHub 不通过 API 暴露用户邮箱，贡献者资料里 `email` 常为 `null`，提交元数据里
+带的又多是 `<id>+<user>@users.noreply.github.com`（noreply 地址，投递不达）。评论 + @ 提及会由 GitHub
+把通知邮件发到对方账号注册的通知邮箱，这是唯一真正能把消息送达对方的通道；失败原因同时留在 PR 上可查。
 
 ### 提交 PR 的清单
 
