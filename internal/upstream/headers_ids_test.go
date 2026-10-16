@@ -133,3 +133,25 @@ func TestChatHeadersConversationInvalidTraceConvReqID(t *testing.T) {
 		t.Errorf("X-B3-SpanId = %q not 16 hex", req.Header.Get("X-B3-SpanId"))
 	}
 }
+
+// TestChatHeadersConversationHeaderFallback 上游渠道校验要求出站 X-Conversation-ID 恒在
+// （缺头返回 400 code=11-128 "conversation id missing"）：客户端没带 conversationId 时，
+// handler 用 ConversationHeaderID 兜底；ConversationID 非空时客户端原值优先于兜底值。
+func TestChatHeadersConversationHeaderFallback(t *testing.T) {
+	a := &auth.Auth{AccessToken: "at", UID: "u1"}
+	c := &Client{}
+
+	// 只有兜底值：X-Conversation-ID 取兜底值（此前该场景不发头 → 上游渠道校验拒收）。
+	req := mustRequest(t)
+	c.ChatHeaders(req, a, "", ChatMeta{ConversationRequestID: "convreq-1", ConversationHeaderID: "synthesized-conv"})
+	if got := req.Header.Get("X-Conversation-ID"); got != "synthesized-conv" {
+		t.Errorf("X-Conversation-ID = %q want synthesized-conv (fallback)", got)
+	}
+
+	// 客户端原值 + 兜底值并存：原值优先。
+	req2 := mustRequest(t)
+	c.ChatHeaders(req2, a, "", ChatMeta{ConversationID: "client-conv", ConversationHeaderID: "synthesized-conv"})
+	if got := req2.Header.Get("X-Conversation-ID"); got != "client-conv" {
+		t.Errorf("X-Conversation-ID = %q want client-conv (client value wins)", got)
+	}
+}

@@ -884,8 +884,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 是服务端指令，走本网关的客户端不属于该形态）。此处**轮转循环外**生成一次，
 	// 循环内每次出站原样复用 → 换号/重试/降级全部同 ID，后台不再碎片化（此前网关
 	// 一个都不发，上游按 HTTP 请求逐条记账，同一对话几十上百个 RequestID）。
-	//   - conversationID：body 提取（透传客户端原值，缺省空串——不伪造，见
-	//     ResolveConversationID；官方后台不校验一致，空会话则不建立聚合键）；
+	//   - conversationID：body 提取（透传客户端原值）；缺省时在下方用轮级聚合键
+	//     ConversationHeaderID 兜底出站 X-Conversation-ID（上游渠道校验要求该头恒在；
+	//     兜底值只进出站头、不进 prompt_cache_key 会话段，缓存键仍按客户端原值——
+	//     轮级键逐轮变化不会打碎前缀缓存）；
 	//   - conversationRequestID：入站 X-Conversation-Request-ID 透传优先（客户端已
 	//     有自己的对话轮 ID 则以客户端为准）。派生分两态：
 	//     * turnKey 非空（有末条 user 消息）→ 带会话键客户端走 TurnRequestID(
@@ -912,6 +914,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	} else {
 		// 无会话键也无轮级键：请求级随机（轮转内捕获一次即共享）。
 		chatMeta.ConversationRequestID = session.TurnRequestID("")
+	}
+	// 上游渠道校验要求出站 X-Conversation-ID 恒在（逐账号直连实测：只要头在场即通过，
+	// 不校验会话存在性；缺头则返回 400 code=11-128 "conversation id missing"）。客户端
+	// 没带 conversationId 时，用上面已算好的轮级聚合键兜底——同轮内重试/换号/降级复用
+	// 同一会话 ID，与 ConversationRequestID 的聚合语义对齐（#170 统一轮级）。
+	// 只写 ConversationHeaderID 而不覆盖 ConversationID：后者仍是 prompt_cache_key
+	// 会话段的哈希源，保持无会话键客户端的「每账号恒键」前缀缓存命中率不被打碎。
+	if chatMeta.ConversationID == "" {
+		chatMeta.ConversationHeaderID = chatMeta.ConversationRequestID
 	}
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
 

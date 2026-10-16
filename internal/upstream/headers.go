@@ -207,7 +207,8 @@ func (c *Client) injectGlobalChatHeaders(req *http.Request, a *auth.Auth) {
 // 复用同值；TraceID 透传入站值（空 = 回落 conversationRequestID）。
 // messageID（消息级，每条独立）由 ChatHeaders 内部生成，无需外部可见。
 type ChatMeta struct {
-	ConversationID        string // X-Conversation-ID：body 提取的入站值，空则不发（透传优先，不伪造）
+	ConversationID        string // X-Conversation-ID：body 提取的入站值，非空时优先（透传客户端原值）
+	ConversationHeaderID  string // X-Conversation-ID 出站兜底：客户端没给 conversationId 时由 handler 合成（上游渠道校验要求该头恒在）；仅进出站头，不进 prompt_cache_key 会话段
 	ConversationRequestID string // X-Conversation-Request-ID / X-Root-Request-ID：聚合主键，必发
 	TraceID               string // X-Trace-ID：入站透传值，空则回落 conversationRequestID
 }
@@ -268,8 +269,9 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 
 // injectConversationHeaders 注入官方客户端会话头族（issue #35 后台聚合）。
 // 头族分四层，各司其职：
-//   - X-Conversation-ID：会话级，多轮稳定（body 的 conversationId）。空则不发——
-//     透传客户端原值优先，客户端没给就不伪造，避免误导后台建错会话。
+//   - X-Conversation-ID：会话级，多轮稳定（body 的 conversationId；客户端没给时由
+//     handler 用轮级聚合键经 ConversationHeaderID 兜底——上游渠道校验要求该头恒在，
+//     缺头会被判为非官方客户端并拒收）。两者都空（零值 meta 直调）才不发。
 //   - X-Conversation-Request-ID：**对话轮级聚合主键**，必发。一次 user send 内的
 //     所有 tool call/重试/换号/降级复用同一个 → 后台按它聚合成一条（不再碎片化）；
 //     换 user 消息即换键（#170 统一轮级，对齐官方 CLI 的 USER_PROMPT_SUBMIT 重生成
@@ -288,8 +290,14 @@ func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
 		convReqID = session.NewMessageID()
 	}
 	messageID := session.NewMessageID()
-	if meta.ConversationID != "" {
-		req.Header.Set("X-Conversation-ID", meta.ConversationID)
+	// X-Conversation-ID：客户端原值优先；缺省时用 handler 合成的兜底值（上游渠道校验
+	// 要求该头恒在，缺头会被判为非官方客户端并拒收）。两者都空（零值 meta 直调）才不发。
+	convID := meta.ConversationID
+	if convID == "" {
+		convID = meta.ConversationHeaderID
+	}
+	if convID != "" {
+		req.Header.Set("X-Conversation-ID", convID)
 	}
 	req.Header.Set("X-Conversation-Request-ID", convReqID)
 	req.Header.Set("X-Conversation-Message-ID", messageID)
