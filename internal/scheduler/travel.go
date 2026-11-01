@@ -9,6 +9,7 @@ import (
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/logfmt"
+	"workbuddy2api/internal/record"
 	"workbuddy2api/internal/upstream"
 )
 
@@ -131,6 +132,10 @@ func (s *Scheduler) travelOne(a *auth.Auth) travelOutcome {
 	buddy, err := s.cfg.Upstream.BuddyInfo(a)
 	if err != nil {
 		log.Printf("travel %s: buddy-info: %v", logfmt.Label(a.UID, a.Nickname), err)
+		s.rec(record.Entry{
+			Kind: record.KindTravel, UID: a.UID, Nickname: a.Nickname,
+			Status: record.StatusFailed, Message: "查询猫档案失败: " + err.Error(), Credits: -1,
+		})
 		return travelFailed
 	}
 	if buddy == nil {
@@ -148,6 +153,10 @@ func (s *Scheduler) travelOne(a *auth.Auth) travelOutcome {
 		return s.travelDepart(a, ts)
 	case travelStateTraveling:
 		log.Printf("travel %s: skip (traveling record=%d)", logfmt.Label(a.UID, a.Nickname), ts.RecordID)
+		s.rec(record.Entry{
+			Kind: record.KindTravel, UID: a.UID, Nickname: a.Nickname, Action: "skip",
+			Status: record.StatusSkipped, Message: "猫正在旅行中，等待到站", Credits: -1,
+		})
 		return travelSkipped
 	default:
 		log.Printf("travel %s: skip (unknown state %q)", logfmt.Label(a.UID, a.Nickname), ts.State)
@@ -159,13 +168,25 @@ func (s *Scheduler) travelOne(a *auth.Auth) travelOutcome {
 func (s *Scheduler) travelDepart(a *auth.Auth, ts *upstream.TravelState) travelOutcome {
 	if ts.DailyLimitReached {
 		log.Printf("travel %s: skip (daily limit reached)", logfmt.Label(a.UID, a.Nickname))
+		s.rec(record.Entry{
+			Kind: record.KindTravel, UID: a.UID, Nickname: a.Nickname, Action: "skip",
+			Status: record.StatusSkipped, Message: "今日已派出过，明天再来", Credits: -1,
+		})
 		return travelSkipped
 	}
 	if err := s.cfg.Upstream.TravelDepart(a, travelLocationID); err != nil {
 		log.Printf("travel %s: depart: %v", logfmt.Label(a.UID, a.Nickname), err)
+		s.rec(record.Entry{
+			Kind: record.KindTravel, UID: a.UID, Nickname: a.Nickname, Action: "depart",
+			Status: record.StatusFailed, Message: "派出失败: " + err.Error(), Credits: -1,
+		})
 		return travelFailed
 	}
 	log.Printf("travel %s: depart ok location=%d", logfmt.Label(a.UID, a.Nickname), travelLocationID)
+	s.rec(record.Entry{
+		Kind: record.KindTravel, UID: a.UID, Nickname: a.Nickname, Action: "depart",
+		Status: record.StatusOK, Message: "猫已派出旅行", Credits: -1,
+	})
 	return travelOK
 }
 
@@ -173,14 +194,26 @@ func (s *Scheduler) travelDepart(a *auth.Auth, ts *upstream.TravelState) travelO
 func (s *Scheduler) travelClaim(a *auth.Auth, ts *upstream.TravelState) travelOutcome {
 	if ts.RecordID == 0 {
 		log.Printf("travel %s: claim skipped (arrived but no record_id)", logfmt.Label(a.UID, a.Nickname))
+		s.rec(record.Entry{
+			Kind: record.KindTravel, UID: a.UID, Nickname: a.Nickname, Action: "claim",
+			Status: record.StatusSkipped, Message: "已到站但缺 record_id，无法领奖", Credits: -1,
+		})
 		return travelSkipped
 	}
 	reward, err := s.cfg.Upstream.TravelClaim(a, ts.RecordID)
 	if err != nil {
 		log.Printf("travel %s: claim record=%d: %v", logfmt.Label(a.UID, a.Nickname), ts.RecordID, err)
+		s.rec(record.Entry{
+			Kind: record.KindTravel, UID: a.UID, Nickname: a.Nickname, Action: "claim",
+			Status: record.StatusFailed, Message: "领奖失败: " + err.Error(), Credits: -1,
+		})
 		return travelFailed
 	}
 	log.Printf("travel %s: claim ok record=%d reward=%d", logfmt.Label(a.UID, a.Nickname), ts.RecordID, reward)
+	s.rec(record.Entry{
+		Kind: record.KindTravel, UID: a.UID, Nickname: a.Nickname, Action: "claim",
+		Status: record.StatusOK, Message: "旅行归来，领取奖励", Reward: reward, Credits: -1,
+	})
 	return travelOK
 }
 
@@ -216,19 +249,35 @@ func (s *Scheduler) adoptBuddy(a *auth.Auth, force bool) travelOutcome {
 	}
 	if err := s.cfg.Upstream.BuddyAgreement(a); err != nil {
 		log.Printf("travel %s: agreement: %v", logfmt.Label(a.UID, a.Nickname), err)
+		s.rec(record.Entry{
+			Kind: record.KindTravel, UID: a.UID, Nickname: a.Nickname, Action: "adopt",
+			Status: record.StatusFailed, Message: "领养协议签署失败: " + err.Error(), Credits: -1,
+		})
 		return travelFailed
 	}
 	err := s.cfg.Upstream.BuddyFirst(a)
 	switch {
 	case err == nil:
 		log.Printf("travel %s: adopt ok (+300 credits)", logfmt.Label(a.UID, a.Nickname))
+		s.rec(record.Entry{
+			Kind: record.KindTravel, UID: a.UID, Nickname: a.Nickname, Action: "adopt",
+			Status: record.StatusOK, Message: "成功领养猫猫", Reward: 300, Credits: -1,
+		})
 		return travelOK
 	case upstream.IsBuddyTaskIncomplete(err):
 		s.markAdoptTried(a.UID)
 		log.Printf("travel %s: adopt skipped (conversation threshold not reached, retry tomorrow)", logfmt.Label(a.UID, a.Nickname))
+		s.rec(record.Entry{
+			Kind: record.KindTravel, UID: a.UID, Nickname: a.Nickname, Action: "adopt",
+			Status: record.StatusSkipped, Message: "领养条件未满足（需至少一次对话），明天重试", Credits: -1,
+		})
 		return travelSkipped
 	default:
 		log.Printf("travel %s: adopt: %v", logfmt.Label(a.UID, a.Nickname), err)
+		s.rec(record.Entry{
+			Kind: record.KindTravel, UID: a.UID, Nickname: a.Nickname, Action: "adopt",
+			Status: record.StatusFailed, Message: "领养失败: " + err.Error(), Credits: -1,
+		})
 		return travelFailed
 	}
 }

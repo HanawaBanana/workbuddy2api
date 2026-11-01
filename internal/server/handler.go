@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,6 +21,7 @@ import (
 	"workbuddy2api/internal/logfmt"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/prompt"
+	"workbuddy2api/internal/record"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
 )
@@ -74,6 +76,11 @@ type Config struct {
 	// 由 cmd/server 在 scheduler 回调里落盘，这里只读回放给 GET /v1/checkin/history。
 	// nil = 未接线（测试形态），端点仍可用但 records 恒为空。
 	CheckinHistory *CheckinHistoryStore
+
+	// Record 定时任务执行记录（internal/record）：签到 / 猫猫旅行 / 保活的逐账号
+	// 结果，GET /v1/records 回放。与 CheckinHistory 分工：那份是签到的完整回执，
+	// 这份是三类任务的混合时间线（面板「执行记录」页数据源）。nil = 不记录。
+	Record *record.Collector
 
 	// CheckinSchedule 只读排程快照 + 下一个自动签到时点（由 *scheduler.Scheduler 实现）。
 	//
@@ -241,6 +248,11 @@ func NewHandler(cfg Config) *Handler {
 	// 含**全部账号的昵称与 UID**，属运维信息，不能开给发给外部调用方的分组密钥。
 	// withAuth + withOps = 「主密钥可用 / 分组密钥 403」，两头都不牺牲。
 	h.mux.HandleFunc("GET /v1/checkin/history", h.withAuth(withOps(h.checkinHistory)))
+	// 定时任务执行记录（GET /v1/records + POST /v1/records/run）：签到 / 猫猫旅行 /
+	// 保活的逐账号结果回放 + 手动触发。与 checkin/history 同鉴权口径（withOps）：
+	// 同样含全部账号的昵称与 UID，属运维信息，不给外部调用方的分组密钥。
+	h.mux.HandleFunc("GET /v1/records", h.withAuth(withOps(h.records)))
+	h.mux.HandleFunc("POST /v1/records/run", h.withAuth(withOps(h.runTask)))
 	// 运维管理端点（默认关闭，config admin.enabled 开启后生效）。
 	// 路径用 {uid} 通配而非查询参数：uid 是账号身份，放进路径便于审计与直观。
 	// 条件注册而非 handler 内 404（设计 supplement §2.3）：未注册的路由对未鉴权
@@ -1528,4 +1540,121 @@ func (h *Handler) hintOf(kind upstream.ErrKind, body, bareModel string, hasImage
 		msg = uerr.Msg
 	}
 	return upstream.GatewayHint(kind, msg, h.hintContext(bareModel, hasImage))
+}
+
+// records 返回定时任务（签到 / 猫猫旅行 / 保活）的执行记录，最新在前。
+//
+// 查询参数（均可选）：
+//
+//	kind=checkin|travel|keepalive   只看某类任务
+//	uid=<账号 UID>                  只看该账号
+//	since=RFC3339 / until=RFC3339   时间范围
+//	limit=<n>                       最多返回条数（默认 200）
+//
+// 同时返回汇总（今日成功/失败/获得积分），供面板顶部卡片展示。
+func (h *Handler) records(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.Record == nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"enabled": false,
+			"message": "执行记录未启用（records.enabled=false）",
+			"items":   []any{},
+		})
+		return
+	}
+	q := record.Query{
+		Kind: record.Kind(strings.TrimSpace(r.URL.Query().Get("kind"))),
+		UID:  strings.TrimSpace(r.URL.Query().Get("uid")),
+	}
+	if v := strings.TrimSpace(r.URL.Query().Get("since")); v != "" {
+		if t, err := time.Parse(time.RFC3339, v); err == nil {
+			q.Since = t
+		}
+	}
+	if v := strings.TrimSpace(r.URL.Query().Get("until")); v != "" {
+		if t, err := time.Parse(time.RFC3339, v); err == nil {
+			q.Until = t
+		}
+	}
+	if v := strings.TrimSpace(r.URL.Query().Get("limit")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			q.Limit = n
+		}
+	}
+
+	items := h.cfg.Record.Query(q)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"enabled": true,
+		"items":   items,
+		"total":   len(items),
+		"stored":  h.cfg.Record.Len(),
+		"summary": h.cfg.Record.Summary(),
+		"now":     time.Now(),
+	})
+}
+
+// runTask 手动触发一次定时任务（签到 / 保活 / 旅行）：POST /v1/records/run，
+// body {"kind": "checkin"|"keepalive"|"travel"}（可空，默认 checkin）。
+//
+// 为什么需要：任务只在固定时点跑（签到 9/21 点、保活 22 点），运维想立刻验证
+// 「签到还能用吗」时不必等到时点。异步触发（立即返回，结果落在执行记录里），
+// 与 /admin/tasks/{name}/run 的区别只在入口与响应形状：那边是运维全白名单
+// （六类任务 + 202 信封），这边是面板契约（三类任务 + 200 信封）。
+//
+// 防重入与 /admin/tasks/{name}/run 共用同一把闸：同名任务跨端点互斥，避免
+// 两个入口连点对上游重复写。注意：会真实调用上游，不是 dry-run。
+func (h *Handler) runTask(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Kind string `json:"kind"`
+	}
+	// body 可为空（默认 checkin）。
+	if r.ContentLength > 0 {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求体不是合法 JSON"})
+			return
+		}
+	}
+	kind := strings.ToLower(strings.TrimSpace(req.Kind))
+	switch kind {
+	case "":
+		kind = "checkin"
+	case "checkin", "keepalive", "travel":
+	default:
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": "kind 只支持 checkin / keepalive / travel",
+		})
+		return
+	}
+	runners := h.taskRunners()
+	if runners == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error": "手动触发未启用（task runner not wired）",
+			"code":  "not_supported",
+		})
+		return
+	}
+	run := runners[kind] // 三个 kind 都在 adminTaskNames 白名单内，必命中
+	h.taskMu.Lock()
+	if h.taskRunning[kind] {
+		h.taskMu.Unlock()
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error": "任务正在执行中: " + kind,
+			"code":  "busy",
+		})
+		return
+	}
+	h.taskRunning[kind] = true
+	h.taskMu.Unlock()
+	go func() {
+		defer func() {
+			h.taskMu.Lock()
+			delete(h.taskRunning, kind)
+			h.taskMu.Unlock()
+		}()
+		run()
+	}()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"kind":    kind,
+		"message": "已触发 " + kind + "，结果稍后见执行记录",
+	})
 }
