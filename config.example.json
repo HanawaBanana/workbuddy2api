@@ -66,6 +66,11 @@
   "budget": {
     "daily_credit_limit": 0
   },
+  "records": {
+    "enabled": true,
+    "file": "./data/records.json",
+    "max": 2000
+  },
   "global": {
     "enabled": true,
     "chat_base": "",

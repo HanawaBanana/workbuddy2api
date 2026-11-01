@@ -127,6 +127,17 @@ type Config struct {
 		DailyCreditLimit float64 `json:"daily_credit_limit"`
 	} `json:"budget"`
 
+	// Records 定时任务执行记录（签到 / 猫猫旅行 / token 保活）：逐账号结果落盘 +
+	// GET /v1/records 回放。这些结果原先只打 stdout，容器日志一滚动就查不到。
+	Records struct {
+		// Enabled 是否记录（默认 true）。关闭时 /v1/records 回 enabled=false。
+		Enabled bool `json:"enabled"`
+		// File 执行记录持久化文件；空 = 纯内存（重启即丢）。
+		File string `json:"file"`
+		// Max 保留条数上限（默认 2000 ≈ 一个多月）；<=0 回落默认。
+		Max int `json:"max"`
+	} `json:"records"`
+
 	Global struct {
 		// Enabled global realm 路由开关。缺省 true：Realm() 正常把 realm=global/
 		// domain=workbuddy.ai 的账号判为 global 并路由 global base/路径。
@@ -308,6 +319,11 @@ func Default() *Config {
 	// 预算闸缺省关闭：daily_credit_limit 的 0 是"不限"哨兵，**故意不回落默认值**
 	// （与 alerting.min_healthy_global 同风格）。这里显式写出以明示这一意图。
 	c.Budget.DailyCreditLimit = 0
+	// 执行记录缺省开启（观测功能，零侵入）：老 config 不含 records 段时也拿到
+	// 落盘 + /v1/records，无需改配置；显式 "records": {"enabled": false} 关闭。
+	c.Records.Enabled = true
+	c.Records.File = "./data/records.json"
+	c.Records.Max = 2000
 	// Alerting 缺省关闭；各阈值/周期给默认值，但 min_healthy_global 与
 	// breaker_threshold 的 0 是"关闭该规则"的哨兵，不能改（见 Config.Alerting 注释）。
 	c.Alerting.IntervalSeconds = 30

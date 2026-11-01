@@ -14,6 +14,7 @@ import (
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/logfmt"
 	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/record"
 	"workbuddy2api/internal/taskledger"
 	"workbuddy2api/internal/upstream"
 )
@@ -95,6 +96,11 @@ type Config struct {
 	// server（成环），映射成 HTTP 口径由 cmd/server 的 buildCheckinReport 负责。
 	// started/finished 为本次签到起止时刻。nil = 不落盘（老调用方/测试零改动）。
 	OnCheckinDone func(outcomes []CheckinOutcome, started, finished time.Time)
+
+	// Record 执行记录收集器（internal/record；可选，nil = 只打日志不记录）。
+	// 与 LedgerFile 的台账分工：台账是运维的逐轮聚合（记录在哪层失败），这里
+	// 是给用户回放的逐账号明细（谁成功了、领了多少），面板「执行记录」页数据源。
+	Record *record.Collector
 }
 
 // Scheduler 调度器。
@@ -180,6 +186,41 @@ type CheckinOutcome struct {
 	Status   CheckinStatus `json:"status"`
 	Credits  *int64        `json:"credits,omitempty"` // 签到后余额（余额查询成功才有值）
 	Detail   string        `json:"detail,omitempty"`  // 失败/跳过原因（"已签到"不填）
+}
+
+// rec 记一条执行记录（internal/record；Record 为 nil 时什么也不做）。
+func (s *Scheduler) rec(e record.Entry) {
+	if s.cfg.Record == nil {
+		return
+	}
+	s.cfg.Record.Add(e)
+}
+
+// recCheckin 把单账号签到结果转成执行记录（面板「执行记录」页的数据源）。
+//
+// 口径：CheckinSkipped（disabled / no credentials / global）不记——这些号根本没进
+// 签到流程，记进来只会让面板被「跳过」刷屏；「今日已签到」记 skipped 而非失败
+// （幂等重复属正常情况，与 travel 的防抖跳过同款语义）。
+func (s *Scheduler) recCheckin(oc CheckinOutcome) {
+	if oc.Status == CheckinSkipped {
+		return
+	}
+	credits := int64(-1) // -1 = 未知（0 是合法余额，不能当缺省）
+	if oc.Credits != nil {
+		credits = *oc.Credits
+	}
+	e := record.Entry{
+		Kind: record.KindCheckin, UID: oc.UID, Nickname: oc.Nickname, Credits: credits,
+	}
+	switch oc.Status {
+	case CheckinOK:
+		e.Status, e.Message = record.StatusOK, "签到成功"
+	case CheckinAlready:
+		e.Status, e.Message = record.StatusSkipped, "今日已签到"
+	default:
+		e.Status, e.Message = record.StatusFailed, oc.Detail
+	}
+	s.rec(e)
 }
 
 // ErrBusy 已有一次签到正在执行（手动入口与定时撞车）。
@@ -616,6 +657,11 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 	}
 	log.Printf("checkin done: total=%d ok=%d already=%d fail=%d skipped=%d",
 		len(statuses), okN, alreadyN, failN, skipN)
+	// 执行记录：挂在 CheckinAll（与 OnCheckinDone 同理由）——手动入口与定时排程
+	// 都走这一个函数，一处埋点两条路径全覆盖。
+	for _, oc := range out {
+		s.recCheckin(oc)
+	}
 	// 顺带做一次签到活动到期预警（只读探测，不影响签到结果；见 checkin_activity.go）。
 	s.warnCheckinActivity(statuses)
 	// 结果回调（落盘供控制台回放）：手动入口与定时排程共用此处，两条路径口径一致。
@@ -945,6 +991,10 @@ func (s *Scheduler) runKeepalive(trigger string) {
 			t.fail++
 			s.cfg.Pool.NoteRefreshFail(st.UID, err) // P0-1 续期观测台账（只记录，不判罚）
 			log.Printf("keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)
+			s.rec(record.Entry{
+				Kind: record.KindKeepalive, UID: st.UID, Nickname: st.Nickname,
+				Status: record.StatusFailed, Message: "刷新 token 失败: " + err.Error(), Credits: -1,
+			})
 			var ue *upstream.Error
 			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
 				if s.cfg.Pool.NoteSessionDead(st.UID) {
@@ -959,7 +1009,18 @@ func (s *Scheduler) runKeepalive(trigger string) {
 		a.BackfillRealm()                   // 老 auth 空 realm → 落盘前补标识（幂等：已有不动）
 		if err := a.SaveAtomic(); err != nil {
 			log.Printf("keepalive %s save: %v", logfmt.Label(st.UID, st.Nickname), err)
+			// token 已刷到手，落盘失败不影响本次保活（台账口径也不计 Fail）——
+			// 但对用户是真实异常（重启会用旧 token），执行记录照记 failed。
+			s.rec(record.Entry{
+				Kind: record.KindKeepalive, UID: st.UID, Nickname: st.Nickname,
+				Status: record.StatusFailed, Message: "token 已刷新但落盘失败: " + err.Error(), Credits: -1,
+			})
+			continue
 		}
+		s.rec(record.Entry{
+			Kind: record.KindKeepalive, UID: st.UID, Nickname: st.Nickname,
+			Status: record.StatusOK, Message: "token 刷新成功", Credits: -1,
+		})
 	}
 	s.recordRun(taskKeepalive, trigger, started, t)
 }

@@ -16,6 +16,7 @@ import (
 	"workbuddy2api/internal/alert"
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/record"
 	"workbuddy2api/internal/redisstore"
 	"workbuddy2api/internal/scheduler"
 	"workbuddy2api/internal/server"
@@ -240,6 +241,16 @@ func main() {
 	if scheduleSeed == "" {
 		scheduleSeed = cfg.AuthDir
 	}
+	// 执行记录收集器（internal/record）：签到 / 旅行 / 保活的逐账号结果落盘，
+	// GET /v1/records 回放给面板。与 taskledger 分工：台账是运维的逐轮聚合，
+	// 这里是给用户看的逐条明细。必须在 scheduler 之前创建——任务里要写它。
+	var recordCollector *record.Collector
+	if cfg.Records.Enabled {
+		recordCollector = record.New(cfg.Records.File)
+		recordCollector.SetMax(cfg.Records.Max)
+		defer recordCollector.Flush()
+	}
+
 	sch := scheduler.New(scheduler.Config{
 		Pool:                p,
 		Upstream:            up,
@@ -271,6 +282,8 @@ func main() {
 		KeepaliveDisabled: !cfg.Schedule.KeepaliveEnabled,
 		SchoolDisabled:    !cfg.Schedule.SchoolEnabled,
 		CatDisabled:       !cfg.Schedule.CatEnabled,
+		// 执行记录（records.enabled / file / max）：nil = 只打日志不记录。
+		Record: recordCollector,
 		// 签到结束即落盘：手动入口与定时排程都走 CheckinAll，挂钩一处两条路径全覆盖。
 		// 映射成 HTTP 口径复用 buildCheckinReport —— 保证「即时回执」与「历史回放」
 		// 永远是同一份数据，不会出现两套计数口径。
@@ -389,6 +402,9 @@ func main() {
 		// 含 jitter 派生）。*scheduler.Scheduler 同时实现 CheckinScheduleProvider。
 		CheckinHistory:  checkinStore,
 		CheckinSchedule: sch,
+		// 执行记录（GET /v1/records + POST /v1/records/run）。Tasks 已注入（sch），
+		// 手动触发走同一套 TaskRunner 与防重入闸。
+		Record: recordCollector,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
