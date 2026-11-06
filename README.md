@@ -37,7 +37,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容上游网关**，将 ```CodeB
 
 ### 本项目不做什么
 
-- **只做上游网关，不做下游协议转换** — 本项目仅负责对接上游 ```CodeBuddy``` 并暴露 OpenAI Chat 协议；Anthropic Messages、Gemini 等其他协议的适配应由下游网关负责；
+- **只做上游网关，不做下游协议转换** — 本项目仅负责对接上游 ```CodeBuddy``` 并暴露 OpenAI 协议；Anthropic Messages、Gemini 等**跨厂商**协议的适配应由下游网关负责（OpenAI 自家的 Responses 形态属同一体系，见[请求链路](#请求链路)，已在网关内适配）；
 - **不内嵌 Web 管理面板** — 网关核心保持精简，可视化面板作为独立项目维护，数据直取上游接口，不增加网关适配负担。
 
 ### 社区前端面板
@@ -87,6 +87,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容上游网关**，将 ```CodeB
   - `prompt.file`（custom/append 生效）指向自定义提示词文件，空 = 内置默认
 - **会话头族注入** — 出站携带官方客户端会话头族（`X-Conversation-Request-ID` 聚合主键 · `X-Conversation-ID` 透传，客户端缺省会话 ID 时用轮级聚合键兜底合成、**该头恒发**（上游渠道校验要求，缺头会被判非官方客户端并拒收，见 #36） · B3 链路），轮转 / 重试 / 路径回退复用同键，后台按对话轮聚合不再碎片化（issue #35）
 - **指纹脱敏** — 出站请求体黑名单指纹字段清洗（可开关），与提示词体系两层叠加
+- **Responses API 兼容**（`POST /v1/responses`）— Codex CLI 0.80+ 起 `wire_api` 只剩 `responses`，本端点在 **Chat 语义之上**做一层协议适配：Responses 请求翻译成内部 chat 请求后**复用同一条链路**（选号 / 粘性 / 轮转 / 熔断 / 预算一分不少），输出再翻译成 Responses 事件流。覆盖 `output_text`、`reasoning_summary_text`（`reasoning_content` 直出为摘要）、`function_call`（含 `namespace` 工具组的铺平与还原，Codex 的 computer use / browser 由此可用）；`custom` 自由文本工具与 `web_search` 等托管工具无 Chat 对等物，直接跳过。无状态实现（不支持 `previous_response_id` / `store`），Codex 每轮重放完整 input 即够用。纯增量路由，`/v1/chat/completions` 行为不变
 
 ### 选号语义
 
@@ -305,6 +306,12 @@ curl -s http://localhost:7863/v1/chat/completions \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
   -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"stream":false}'
+
+# Responses API（Codex CLI 走这条）
+curl -sN http://localhost:7863/v1/responses \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4-flash","input":"hi","stream":true}'
 ```
 
 ## 贡献与 PR 要求

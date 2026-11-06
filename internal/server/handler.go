@@ -224,6 +224,11 @@ func NewHandler(cfg Config) *Handler {
 		budget:      newDailyBudget(cfg.BudgetLimit),
 	}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
+	// OpenAI Responses API 兼容入口（Codex CLI 0.80+ 唯一支持的协议）。
+	// 内部把 Responses 请求翻成 chat 请求后复用 chatCompletions 的完整链路
+	// （账号池/轮转/熔断/粘性/积分预算），输出再翻回 Responses 事件流。
+	// 纯增量路由：既有 /v1/chat/completions 行为逐字节不变。
+	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /v1/stats", h.withAuth(h.stats))
